@@ -6,8 +6,6 @@ import logging
 import asyncio
 
 # ================= CRITICAL FIX FOR PYTHON 3.14+ =================
-# Pyrogram crashes on import in Python 3.14+ if an event loop is not already set.
-# We MUST create and set the event loop BEFORE importing Pyrogram.
 try:
     asyncio.get_event_loop()
 except RuntimeError:
@@ -29,8 +27,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-logger.info("System is booting up... Checking Environment Variables.")
-
 # ================= ENVIRONMENT VARIABLES & VALIDATION =================
 API_ID_STR = os.environ.get("API_ID", "").strip()
 API_HASH = os.environ.get("API_HASH", "").strip()
@@ -39,32 +35,25 @@ DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "").strip()
 GOOGLE_CREDS_STR = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
 AUTH_USERS_STR = os.environ.get("AUTHORIZED_USERS", "")
 
-# Strict Checking to prevent silent crashes
 if not API_ID_STR or not API_ID_STR.isdigit():
-    logger.error("CRITICAL ERROR: API_ID is missing or invalid in Render Environment Variables!")
+    logger.error("CRITICAL ERROR: API_ID is missing or invalid!")
     sys.exit(1)
-
 if not API_HASH:
-    logger.error("CRITICAL ERROR: API_HASH is missing in Render Environment Variables!")
+    logger.error("CRITICAL ERROR: API_HASH is missing!")
     sys.exit(1)
-
 if not BOT_TOKEN:
-    logger.error("CRITICAL ERROR: BOT_TOKEN is missing! Make sure the variable name is exactly 'BOT_TOKEN'.")
+    logger.error("CRITICAL ERROR: BOT_TOKEN is missing!")
     sys.exit(1)
-    
 if not DRIVE_FOLDER_ID:
-    logger.error("CRITICAL ERROR: DRIVE_FOLDER_ID is missing in Render Environment Variables!")
+    logger.error("CRITICAL ERROR: DRIVE_FOLDER_ID is missing!")
     sys.exit(1)
-    
 if not GOOGLE_CREDS_STR:
-    logger.error("CRITICAL ERROR: GOOGLE_CREDENTIALS_JSON is missing in Render Environment Variables!")
+    logger.error("CRITICAL ERROR: GOOGLE_CREDENTIALS_JSON is missing!")
     sys.exit(1)
 
 API_ID = int(API_ID_STR)
 AUTHORIZED_USERS = [int(u.strip()) for u in AUTH_USERS_STR.split(",") if u.strip().isdigit()]
 SCOPES = ['https://www.googleapis.com/auth/drive.file']
-
-logger.info("Environment Variables checked successfully. Proceeding...")
 
 # ================= TELEGRAM BOT INITIALIZATION =================
 app = Client(
@@ -72,7 +61,7 @@ app = Client(
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    in_memory=True  # Safest option for Cloud Hosting
+    in_memory=True
 )
 
 def get_drive_service():
@@ -81,10 +70,11 @@ def get_drive_service():
         creds_dict = json.loads(GOOGLE_CREDS_STR)
         creds = service_account.Credentials.from_service_account_info(
             creds_dict, scopes=SCOPES)
-        return build('drive', 'v3', credentials=creds)
+        return True, build('drive', 'v3', credentials=creds)
     except Exception as e:
-        logger.error(f"Google Drive Credentials Error: {e}")
-        return None
+        error_msg = f"Credentials JSON parsing error: {str(e)}"
+        logger.error(error_msg)
+        return False, error_msg
 
 def format_size(bytes_size):
     """Formats bytes to MB."""
@@ -99,7 +89,6 @@ async def update_progress(current, total, msg, start_time, action_text):
     if not hasattr(msg, "last_update_time"):
         msg.last_update_time = start_time
 
-    # Update every 3 seconds to avoid Telegram API FloodWait limits
     if (now - msg.last_update_time > 3.0) or (current == total):
         msg.last_update_time = now
         
@@ -122,12 +111,13 @@ async def update_progress(current, total, msg, start_time, action_text):
             pass 
 
 async def upload_to_drive_async(file_path, file_name, msg):
-    """Uploads file to Drive asynchronously, updating progress."""
+    """Uploads file to Drive asynchronously and returns success status + detail."""
     try:
-        service = get_drive_service()
-        if not service:
-            return None
+        success, service_or_error = get_drive_service()
+        if not success:
+            return False, service_or_error
             
+        service = service_or_error
         file_size = os.path.getsize(file_path)
         file_metadata = {'name': file_name, 'parents': [DRIVE_FOLDER_ID]}
         
@@ -144,10 +134,11 @@ async def upload_to_drive_async(file_path, file_name, msg):
                     status.resumable_progress, file_size, msg, start_time, "☁️ Uploading to Google Drive..."
                 )
                 
-        return response.get('id')
+        return True, response.get('id')
     except Exception as e:
-        logger.error(f"Upload error: {e}")
-        return None
+        error_details = str(e)
+        logger.error(f"Upload error: {error_details}")
+        return False, error_details
 
 def check_auth(user_id):
     """Checks if the user is authorized to use the bot."""
@@ -183,19 +174,19 @@ async def handle_files(client, message):
         )
         file_name = os.path.basename(file_path)
         
-        drive_file_id = await upload_to_drive_async(file_path, file_name, msg)
+        success, result = await upload_to_drive_async(file_path, file_name, msg)
         
-        if drive_file_id:
+        if success:
             await msg.edit_text(f"✅ Upload Complete!\n\nFile Name: {file_name}")
         else:
-            await msg.edit_text("❌ Upload failed. Check Drive ID or Credentials.")
+            await msg.edit_text(f"❌ Upload failed.\n\n⚠️ Error Reason:\n`{result}`")
             
         if os.path.exists(file_path):
             os.remove(file_path)
             
     except Exception as e:
         logger.error(f"Telegram file error: {e}")
-        await msg.edit_text(f"❌ An error occurred: {e}")
+        await msg.edit_text(f"❌ An error occurred during download:\n`{str(e)}`")
 
 @app.on_message(filters.regex(r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+"))
 async def handle_links(client, message):
@@ -226,19 +217,19 @@ async def handle_links(client, message):
                         if total_size > 0:
                             await update_progress(downloaded, total_size, msg, start_time, "📥 Downloading to server...")
                             
-        drive_file_id = await upload_to_drive_async(file_path, file_name, msg)
+        success, result = await upload_to_drive_async(file_path, file_name, msg)
         
-        if drive_file_id:
+        if success:
             await msg.edit_text(f"✅ Link Upload Complete!\n\nFile Name: {file_name}")
         else:
-            await msg.edit_text("❌ Upload failed.")
+            await msg.edit_text(f"❌ Upload failed.\n\n⚠️ Error Reason:\n`{result}`")
             
         if os.path.exists(file_path):
             os.remove(file_path)
             
     except Exception as e:
         logger.error(f"Link download error: {e}")
-        await msg.edit_text(f"❌ Error handling link: {e}")
+        await msg.edit_text(f"❌ Error handling link:\n`{str(e)}`")
 
 # ================= WEB SERVER =================
 async def start_web_server():
@@ -269,7 +260,6 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        # We fetch the loop we created at the top of the file
         loop = asyncio.get_event_loop()
         loop.run_until_complete(main())
     except KeyboardInterrupt:
