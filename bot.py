@@ -26,13 +26,37 @@ from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
-# ================= LOGGING SETUP =================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    stream=sys.stdout
-)
+# Try importing Video Processing Libraries
+try:
+    import cv2
+    from PIL import Image
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
+
+# ================= LOGGING SETUP (Memory Included) =================
+class MemoryLogHandler(logging.Handler):
+    def __init__(self, capacity=20):
+        super().__init__()
+        self.capacity = capacity
+        self.logs = []
+    def emit(self, record):
+        self.logs.append(self.format(record))
+        if len(self.logs) > self.capacity:
+            self.logs.pop(0)
+
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# Console Output
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+logger.addHandler(console_handler)
+
+# Memory Output for /logs command
+memory_handler = MemoryLogHandler(capacity=20)
+memory_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
+logger.addHandler(memory_handler)
 
 # ================= ENVIRONMENT VARIABLES =================
 API_ID_STR = os.environ.get("API_ID", "").strip()
@@ -43,8 +67,6 @@ GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
 GOOGLE_OAUTH_TOKEN = os.environ.get("GOOGLE_OAUTH_TOKEN", "").strip()
 AUTH_USERS_STR = os.environ.get("AUTHORIZED_USERS", "")
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://gdriveuploadbot.onrender.com")
-
-# Cloudflare GoIndex URL (e.g., https://gdrive.rahatx.workers.dev)
 CF_WORKER_URL = os.environ.get("CF_WORKER_URL", "").strip().rstrip('/')
 
 os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = '1'
@@ -60,9 +82,15 @@ SCOPES = ['https://www.googleapis.com/auth/drive']
 
 oauth_flow = None
 
-# Caching structures for interactive operations
+# ================= CACHE & STATES =================
 LINK_CACHE = {}  
 USER_STATES = {} 
+MYFILES_CACHE = {} # For Pagination
+PREVIEW_CACHE = {} # For Video Previews
+BOT_STATS = {"uploads": 0, "clones": 0, "bytes_uploaded": 0}
+
+# Create Previews Folder
+os.makedirs("previews", exist_ok=True)
 
 # ================= TELEGRAM BOT =================
 app = Client(
@@ -100,6 +128,71 @@ def get_safe_error(e):
     for char in ['<', '>', '`', '*', '_', '[', ']']:
         err_str = err_str.replace(char, '')
     return err_str[:800]
+
+def generate_video_preview(video_path, output_path):
+    if not HAS_CV2: return False
+    try:
+        cap = cv2.VideoCapture(video_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if total_frames <= 0 or fps <= 0: return False
+
+        frames = []
+        for i in range(10):
+            frame_id = int(total_frames * (0.05 + 0.09 * i))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
+            ret, frame = cap.read()
+            if ret:
+                frame = cv2.resize(frame, (320, 180))
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frames.append(Image.fromarray(frame))
+        cap.release()
+        if not frames: return False
+
+        w, h = 320, 180
+        collage = Image.new('RGB', (w * 2, h * 5))
+        for i, img in enumerate(frames):
+            collage.paste(img, ((i % 2) * w, (i // 2) * h))
+        collage.save(output_path, format="JPEG", quality=85)
+        return True
+    except Exception as e:
+        logger.error(f"Preview gen error: {e}")
+        return False
+
+# BUG FIXED: Added `, False` for file ID returns!
+def extract_gdrive_id(url):
+    match = re.search(r"/d/([a-zA-Z0-9_-]+)", url)
+    if match: return match.group(1), False
+    match = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", url)
+    if match: return match.group(1), False
+    match = re.search(r"/folders/([a-zA-Z0-9_-]+)", url)
+    if match: return match.group(1), True
+    return None, False
+
+def check_auth(user_id):
+    if not AUTHORIZED_USERS: return True
+    return user_id in AUTHORIZED_USERS
+
+def generate_result_text(file_name, file_id, file_size, elapsed_time, is_folder=False):
+    drive_link = f"https://drive.google.com/drive/folders/{file_id}" if is_folder else f"https://drive.google.com/file/d/{file_id}/view"
+    
+    safe_name = urllib.parse.quote(file_name)
+    if CF_WORKER_URL:
+        # GoIndex Format with 0:down
+        direct_link = f"{CF_WORKER_URL}/0:down/{safe_name}"
+        if is_folder: direct_link += "/"
+    else:
+        direct_link = "https://t.me/c/NotConfigured"
+        
+    text = (
+        f"✅ **Task Completed Successfully!**\n\n"
+        f"📄 **Name:** `{file_name}`\n"
+        f"📦 **Size:** `{format_size(file_size)}`\n"
+        f"⏱️ **Time Taken:** `{format_time(elapsed_time)}`\n\n"
+        f"🔗 [Google Drive Link]({drive_link})\n\n"
+        f"⚡ [Direct Download Link]({direct_link})"
+    )
+    return text
 
 async def update_progress(current, total, msg, start_time, action_text):
     if total == 0: return
@@ -150,6 +243,8 @@ async def upload_to_drive_async(file_path, file_name, msg, parent_id=DRIVE_FOLDE
                 await update_progress(status.resumable_progress, file_size, msg, start_time, "☁️ Uploading to Google Drive...")
                 
         elapsed = time.time() - start_time
+        BOT_STATS["uploads"] += 1
+        BOT_STATS["bytes_uploaded"] += file_size
         return True, response.get('id'), file_size, elapsed
     except Exception as e:
         return False, get_safe_error(e), 0, 0
@@ -171,6 +266,7 @@ async def clone_gdrive_item(item_id, is_folder=False, parent_id=DRIVE_FOLDER_ID)
             response = await asyncio.to_thread(
                 lambda: service.files().copy(fileId=item_id, body=body, fields='id, name').execute()
             )
+            BOT_STATS["clones"] += 1
             return True, response
         else:
             original_folder = service.files().get(fileId=item_id, fields='name').execute()
@@ -186,6 +282,7 @@ async def clone_gdrive_item(item_id, is_folder=False, parent_id=DRIVE_FOLDER_ID)
                 else:
                     await clone_gdrive_item(item['id'], is_folder=False, parent_id=new_folder_id)
                     
+            BOT_STATS["clones"] += 1
             return True, {"name": original_folder.get('name'), "id": new_folder_id}
     except Exception as e:
         return False, get_safe_error(e)
@@ -197,43 +294,149 @@ def extract_zip(zip_path, extract_dir):
         return True, "Success"
     except RuntimeError as e:
         if 'password' in str(e).lower() or 'encrypted' in str(e).lower():
-            return False, "Password protected ZIPs are not supported yet."
+            return False, "This ZIP is password protected and cannot be extracted."
         return False, str(e)
     except Exception as e:
         return False, str(e)
 
-def extract_gdrive_id(url):
-    match = re.search(r"/d/([a-zA-Z0-9_-]+)", url)
-    if match: return match.group(1)
-    match = re.search(r"id=([a-zA-Z0-9_-]+)", url)
-    if match: return match.group(1)
-    match = re.search(r"/folders/([a-zA-Z0-9_-]+)", url)
-    if match: return match.group(1), True
-    return None, False
-
-def check_auth(user_id):
-    if not AUTHORIZED_USERS: return True
-    return user_id in AUTHORIZED_USERS
-
-def generate_result_text(file_name, file_id, file_size, elapsed_time):
-    drive_link = f"https://drive.google.com/file/d/{file_id}/view"
-    
-    # URL Encode the filename for GoIndex direct link
-    safe_file_name = urllib.parse.quote(file_name)
-    direct_link = f"{CF_WORKER_URL}/{safe_file_name}" if CF_WORKER_URL else "Not Configured"
-    
+# ================= NEW COMMANDS =================
+@app.on_message(filters.command("stats"))
+async def stats_command(client, message):
+    if not check_auth(message.from_user.id): return
     text = (
-        f"✅ **Task Completed Successfully!**\n\n"
-        f"📄 **Name:** `{file_name}`\n"
-        f"📦 **Size:** `{format_size(file_size)}`\n"
-        f"⏱️ **Time Taken:** `{format_time(elapsed_time)}`\n\n"
-        f"🔗 **Google Drive Link:**\n{drive_link}\n\n"
-        f"⚡ **Direct Download Link (GoIndex):**\n{direct_link}"
+        "📊 **Bot Current Session Stats:**\n\n"
+        f"📤 Total Uploads: `{BOT_STATS['uploads']}`\n"
+        f"🔄 Total Clones: `{BOT_STATS['clones']}`\n"
+        f"💾 Data Uploaded: `{format_size(BOT_STATS['bytes_uploaded'])}`"
     )
-    return text
+    await message.reply_text(text)
 
-# ================= MESSAGE HANDLERS =================
+@app.on_message(filters.command("logs"))
+async def logs_command(client, message):
+    if not check_auth(message.from_user.id): return
+    logs_txt = "\n".join(memory_handler.logs) if memory_handler.logs else "No recent logs."
+    await message.reply_text(f"📜 **Recent Logs:**\n`{logs_txt[-3000:]}`") # Send last 3k chars
 
+@app.on_message(filters.command("storage"))
+async def storage_command(client, message):
+    if not check_auth(message.from_user.id): return
+    success, service = get_drive_service()
+    if not success: return await message.reply_text("Auth Error.")
+    try:
+        about = service.about().get(fields="storageQuota").execute()
+        quota = about.get('storageQuota', {})
+        limit = int(quota.get('limit', 0))
+        usage = int(quota.get('usage', 0))
+        
+        if limit == 0:
+            text = f"💾 **Drive Storage:**\n\n**Used:** `{format_size(usage)}`\n**Total:** `Unlimited`"
+        else:
+            text = f"💾 **Drive Storage:**\n\n**Used:** `{format_size(usage)}`\n**Free:** `{format_size(limit - usage)}`\n**Total:** `{format_size(limit)}`"
+        await message.reply_text(text)
+    except Exception as e:
+        await message.reply_text(f"Storage info fetch failed: {e}")
+
+@app.on_message(filters.command("search"))
+async def search_command(client, message):
+    if not check_auth(message.from_user.id): return
+    query = message.text.split(maxsplit=1)
+    if len(query) < 2: 
+        return await message.reply_text("⚠️ **Usage:** `/search <filename>`")
+        
+    keyword = query[1]
+    success, service = get_drive_service()
+    if not success: return await message.reply_text("Auth Error.")
+    
+    msg = await message.reply_text("🔍 Searching...")
+    try:
+        # Fuzzy search simulation with "OR" conditions for each word
+        words = keyword.split()
+        search_terms = " or ".join([f"name contains '{w}'" for w in words])
+        q = f"trashed=false and ({search_terms})"
+        
+        results = service.files().list(q=q, fields="files(id, name, mimeType, size)", pageSize=20).execute()
+        items = results.get('files', [])
+        
+        if not items:
+            return await msg.edit_text("❌ No similar files found.")
+            
+        # Put items in MYFILES_CACHE to reuse pagination UI
+        MYFILES_CACHE[message.from_user.id] = {
+            "items": items, "page": 0, "parent": "search_results", "stack": []
+        }
+        await render_myfiles_page(msg, message.from_user.id)
+    except Exception as e:
+        await msg.edit_text(f"Search failed: {get_safe_error(e)}")
+
+# ================= ADVANCED MYFILES (Pagination) =================
+@app.on_message(filters.command("myfiles"))
+async def myfiles_command(client, message):
+    if not check_auth(message.from_user.id): return
+    await fetch_and_render_folder(message, message.from_user.id, DRIVE_FOLDER_ID, init=True)
+
+async def fetch_and_render_folder(message_obj_or_query, user_id, folder_id, init=False):
+    success, service = get_drive_service()
+    if not success: return
+    
+    msg = await message_obj_or_query.reply_text("Fetching files...") if init else message_obj_or_query.message
+    
+    try:
+        query = f"'{folder_id}' in parents and trashed=false"
+        results = service.files().list(q=query, orderBy="folder, modifiedTime desc", fields="files(id, name, mimeType, size)", pageSize=100).execute()
+        items = results.get('files', [])
+        
+        if init:
+            MYFILES_CACHE[user_id] = {"items": items, "page": 0, "parent": folder_id, "stack": []}
+        else:
+            stack = MYFILES_CACHE[user_id]["stack"]
+            MYFILES_CACHE[user_id] = {"items": items, "page": 0, "parent": folder_id, "stack": stack}
+            
+        await render_myfiles_page(msg, user_id)
+    except Exception as e:
+        await (msg.edit_text if not init else msg.reply_text)(f"Fetch failed: {get_safe_error(e)}")
+
+async def render_myfiles_page(msg, user_id):
+    cache = MYFILES_CACHE.get(user_id)
+    if not cache: return await msg.edit_text("Session expired. Type /myfiles again.")
+    
+    items = cache["items"]
+    page = cache["page"]
+    per_page = 3
+    total_pages = (len(items) + per_page - 1) // per_page
+    
+    if not items:
+        text = "📂 **Folder is empty!**"
+        buttons = []
+        if cache["stack"]: buttons.append([InlineKeyboardButton("🔼 Back to Parent", callback_data="mf_back")])
+        return await msg.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
+        
+    start_idx = page * per_page
+    end_idx = min(start_idx + per_page, len(items))
+    current_items = items[start_idx:end_idx]
+    
+    text = f"📁 **Files List (Page {page+1}/{total_pages}):**\n\n"
+    buttons = []
+    
+    for i, item in enumerate(current_items):
+        is_folder = item['mimeType'] == 'application/vnd.google-apps.folder'
+        icon = "📁" if is_folder else "📄"
+        idx_in_cache = start_idx + i
+        text += f"{i+1}. {icon} `{item['name']}`\n"
+        
+        btn_text = f"📂 Open #{i+1}" if is_folder else f"⚙️ Options #{i+1}"
+        buttons.append([InlineKeyboardButton(btn_text, callback_data=f"mf_act|{idx_in_cache}")])
+
+    # Navigation Row
+    nav_row = []
+    if page > 0: nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data="mf_nav|prev"))
+    if page < total_pages - 1: nav_row.append(InlineKeyboardButton("Next ➡️", callback_data="mf_nav|next"))
+    if nav_row: buttons.append(nav_row)
+    
+    if cache["stack"]: buttons.append([InlineKeyboardButton("🔼 Back to Parent", callback_data="mf_back")])
+    
+    await msg.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+# ================= GENERAL COMMANDS =================
 @app.on_message(filters.command("start"))
 async def start_command(client, message):
     if not check_auth(message.from_user.id): return
@@ -245,40 +448,15 @@ async def start_command(client, message):
         "Send me a link or file. I support:\n"
         "- Direct Download Links (With Rename/Extract features)\n"
         "- Google Drive File/Folder Links (Instant Clone)\n"
-        "- Telegram Files\n"
-        "- Use `/myfiles` to manage your drive."
+        "- Telegram Files\n\n"
+        "**Useful Commands:**\n"
+        "`/myfiles` - Advanced Drive Manager\n"
+        "`/search <name>` - Search files\n"
+        "`/stats` - Session Upload Stats\n"
+        "`/storage` - Check Drive space"
     )
 
-@app.on_message(filters.command("myfiles"))
-async def myfiles_command(client, message):
-    if not check_auth(message.from_user.id): return
-    success, service = get_drive_service()
-    if not success: return await message.reply_text("Auth Error.")
-    
-    msg = await message.reply_text("Fetching your recent files...")
-    try:
-        query = f"'{DRIVE_FOLDER_ID}' in parents and trashed=false"
-        results = service.files().list(q=query, orderBy="createdTime desc", fields="files(id, name)", pageSize=10).execute()
-        items = results.get('files', [])
-        
-        if not items:
-            return await msg.edit_text("Your designated Drive folder is empty.")
-            
-        buttons = []
-        text = "📁 **Recent 10 Files in your Drive:**\n\n"
-        for i, item in enumerate(items, 1):
-            text += f"{i}. `{item['name']}`\n"
-            row = [
-                InlineKeyboardButton(f"Rename #{i}", callback_data=f"ren_file|{item['id']}"),
-                InlineKeyboardButton(f"Delete #{i}", callback_data=f"del_file|{item['id']}")
-            ]
-            buttons.append(row)
-            
-        await msg.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-    except Exception as e:
-        await msg.edit_text(f"Error fetching files: {get_safe_error(e)}")
-
-@app.on_message(filters.text & ~filters.command(["start", "myfiles"]))
+@app.on_message(filters.text & ~filters.command(["start", "myfiles", "stats", "logs", "storage", "search"]))
 async def handle_text_input(client, message):
     if not check_auth(message.from_user.id): return
     user_id = message.from_user.id
@@ -288,7 +466,6 @@ async def handle_text_input(client, message):
         new_name = message.text.strip()
         url = state.get("url")
         del USER_STATES[user_id]
-        
         await message.reply_text(f"Renaming to: `{new_name}`...")
         await process_download(client, message, url, new_name, extract=False)
         return
@@ -297,7 +474,6 @@ async def handle_text_input(client, message):
         new_name = message.text.strip()
         file_id = state.get("file_id")
         del USER_STATES[user_id]
-        
         success, service = get_drive_service()
         if success:
             try:
@@ -316,7 +492,8 @@ async def handle_text_input(client, message):
             msg = await message.reply_text(f"🔄 Cloning {'Folder' if is_folder else 'File'} to Drive...")
             success, result = await clone_gdrive_item(g_id, is_folder)
             if success:
-                await msg.edit_text(f"✅ GDrive Clone Complete!\n\nName: `{result.get('name')}`")
+                name = result.get('name') if is_folder else result.get('name', 'File')
+                await msg.edit_text(f"✅ GDrive Clone Complete!\n\nName: `{name}`")
             else:
                 await msg.edit_text(f"❌ GDrive Clone Failed.\n\nReason:\n{result}")
             return
@@ -338,32 +515,77 @@ async def handle_text_input(client, message):
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
+# ================= CALLBACK HANDLERS =================
 @app.on_callback_query()
 async def callback_handler(client, query: CallbackQuery):
     user_id = query.from_user.id
     data = query.data.split("|")
     action = data[0]
 
+    # ---- DOWNLOAD/EXTRACT LINKS ----
     if action in ["dl_now", "dl_ren", "dl_ext"]:
         msg_id = int(data[1])
         link_data = LINK_CACHE.get(msg_id)
-        
         if not link_data:
             return await query.answer("Session expired. Send link again.", show_alert=True)
             
         url = link_data["url"]
         default_name = link_data["name"]
-        
         await query.message.delete()
         
-        if action == "dl_now":
-            await process_download(client, query.message, url, default_name, extract=False)
-        elif action == "dl_ext":
-            await process_download(client, query.message, url, default_name, extract=True)
+        if action == "dl_now": await process_download(client, query.message, url, default_name, extract=False)
+        elif action == "dl_ext": await process_download(client, query.message, url, default_name, extract=True)
         elif action == "dl_ren":
             USER_STATES[user_id] = {"action": "wait_rename", "url": url}
             await app.send_message(user_id, "Please send the **new name** for the file (including extension like .mp4, .mkv):")
-            
+
+    # ---- VIDEO PREVIEW ----
+    elif action == "pv":
+        preview_id = data[1]
+        img_path = PREVIEW_CACHE.get(preview_id)
+        if img_path and os.path.exists(img_path):
+            await query.answer("Uploading Preview...")
+            await query.message.reply_photo(photo=img_path, caption="🎬 **Video Clips Preview**")
+        else:
+            await query.answer("Preview image not found or expired.", show_alert=True)
+
+    # ---- MYFILES NAVIGATION ----
+    elif action == "mf_nav":
+        cache = MYFILES_CACHE.get(user_id)
+        if not cache: return await query.answer("Session expired.", show_alert=True)
+        if data[1] == "next": cache["page"] += 1
+        elif data[1] == "prev": cache["page"] -= 1
+        await render_myfiles_page(query.message, user_id)
+        
+    elif action == "mf_back":
+        cache = MYFILES_CACHE.get(user_id)
+        if not cache or not cache["stack"]: return
+        parent_id = cache["stack"].pop()
+        await fetch_and_render_folder(query, user_id, parent_id, init=False)
+
+    elif action == "mf_act":
+        cache = MYFILES_CACHE.get(user_id)
+        if not cache: return await query.answer("Session expired.", show_alert=True)
+        idx = int(data[1])
+        item = cache["items"][idx]
+        
+        if item['mimeType'] == 'application/vnd.google-apps.folder':
+            cache["stack"].append(cache["parent"])
+            await fetch_and_render_folder(query, user_id, item['id'], init=False)
+        else:
+            size = int(item.get('size', 0))
+            text = generate_result_text(item['name'], item['id'], size, 0)
+            buttons = [
+                [InlineKeyboardButton("✏️ Rename", callback_data=f"ren_file|{item['id']}"),
+                 InlineKeyboardButton("🗑️ Remove", callback_data=f"del_file|{item['id']}")],
+                [InlineKeyboardButton("🔙 Back to List", callback_data="mf_ret")]
+            ]
+            await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif action == "mf_ret":
+        await render_myfiles_page(query.message, user_id)
+
+    # ---- DRIVE FILE MANAGEMENT ----
     elif action == "del_file":
         file_id = data[1]
         success, service = get_drive_service()
@@ -371,7 +593,7 @@ async def callback_handler(client, query: CallbackQuery):
             try:
                 service.files().delete(fileId=file_id).execute()
                 await query.answer("File Deleted from GDrive!", show_alert=True)
-                await query.message.delete()
+                await render_myfiles_page(query.message, user_id)
             except Exception as e:
                 await query.answer(f"Failed: {get_safe_error(e)}", show_alert=True)
                 
@@ -399,6 +621,16 @@ async def process_download(client, message, url, file_name, extract=False):
                         if total_size > 0:
                             await update_progress(downloaded, total_size, msg, start_time, "📥 Downloading to server...")
                             
+        # Video Preview Handling
+        preview_id = None
+        if file_name.lower().endswith(('.mp4', '.mkv', '.avi', '.webm')):
+            await msg.edit_text("🎬 Extracting Video Preview...")
+            pv_path = f"./previews/{int(time.time())}.jpg"
+            if generate_video_preview(file_path, pv_path):
+                preview_id = str(int(time.time()))
+                PREVIEW_CACHE[preview_id] = pv_path
+
+        # Extraction Handling
         if extract and file_name.lower().endswith('.zip'):
             await msg.edit_text("📦 Extracting ZIP file...")
             extract_dir = os.path.join(os.getcwd(), file_name + "_extracted")
@@ -408,7 +640,7 @@ async def process_download(client, message, url, file_name, extract=False):
             if not success:
                 os.remove(file_path)
                 shutil.rmtree(extract_dir, ignore_errors=True)
-                return await msg.edit_text(f"❌ Extraction Failed: {ext_result}")
+                return await msg.edit_text(f"❌ Extraction Failed:\n`{ext_result}`")
                 
             await msg.edit_text("📁 Creating folder in Drive and uploading contents...")
             folder_name = file_name.replace(".zip", "")
@@ -423,22 +655,26 @@ async def process_download(client, message, url, file_name, extract=False):
                     if up_success: total_files_uploaded += 1
                         
             elapsed = time.time() - start_time
-            
-            # GoIndex direct link for the new folder
-            safe_folder_name = urllib.parse.quote(folder_name)
-            folder_direct_link = f"{CF_WORKER_URL}/{safe_folder_name}/" if CF_WORKER_URL else "Not Configured"
-            
-            await msg.edit_text(f"✅ **Extraction & Upload Complete!**\n\n📁 **Folder:** `{folder_name}`\n📄 **Files Uploaded:** `{total_files_uploaded}`\n⏱️ **Time Taken:** `{format_time(elapsed)}`\n\n⚡ **Folder Direct Link:**\n{folder_direct_link}")
+            text = generate_result_text(folder_name, new_folder_id, 0, elapsed, is_folder=True)
+            await msg.edit_text(text)
             
             os.remove(file_path)
             shutil.rmtree(extract_dir, ignore_errors=True)
             return
 
+        # Normal Upload
         success, file_id, file_size, upload_time = await upload_to_drive_async(file_path, file_name, msg)
         
         if success:
             total_elapsed = time.time() - start_time
-            await msg.edit_text(generate_result_text(file_name, file_id, file_size, total_elapsed))
+            text = generate_result_text(file_name, file_id, file_size, total_elapsed)
+            
+            # Attach preview button if available
+            reply_markup = None
+            if preview_id:
+                reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🎬 View Preview", callback_data=f"pv|{preview_id}")]])
+                
+            await msg.edit_text(text, reply_markup=reply_markup)
         else:
             await msg.edit_text(f"❌ Upload failed.\n\n⚠️ Reason:\n{file_id}")
             
@@ -462,11 +698,23 @@ async def handle_telegram_files(client, message):
         file_path = await message.download(progress=update_progress, progress_args=(msg, start_time, "📥 Downloading from Telegram..."))
         file_name = os.path.basename(file_path)
         
+        preview_id = None
+        if file_name.lower().endswith(('.mp4', '.mkv', '.avi', '.webm')):
+            await msg.edit_text("🎬 Extracting Video Preview...")
+            pv_path = f"./previews/{int(time.time())}.jpg"
+            if generate_video_preview(file_path, pv_path):
+                preview_id = str(int(time.time()))
+                PREVIEW_CACHE[preview_id] = pv_path
+
         success, file_id, file_size, up_time = await upload_to_drive_async(file_path, file_name, msg)
         
         if success:
             total_elapsed = time.time() - start_time
-            await msg.edit_text(generate_result_text(file_name, file_id, file_size, total_elapsed))
+            text = generate_result_text(file_name, file_id, file_size, total_elapsed)
+            reply_markup = None
+            if preview_id:
+                reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🎬 View Preview", callback_data=f"pv|{preview_id}")]])
+            await msg.edit_text(text, reply_markup=reply_markup)
         else:
             await msg.edit_text(f"❌ Upload failed.\nReason: {file_id}")
     finally:
@@ -474,7 +722,7 @@ async def handle_telegram_files(client, message):
             os.remove(file_path)
 
 # ================= WEB SERVER =================
-async def handle_home(request): return web.Response(text="Bot running. Go to /login to auth.")
+async def handle_home(request): return web.Response(text="Bot is running! Go to /login to authorize.")
 async def handle_login(request):
     global oauth_flow
     flow = Flow.from_client_config(json.loads(GOOGLE_CLIENT_SECRET), scopes=SCOPES)
@@ -490,7 +738,7 @@ async def handle_callback(request):
     creds = oauth_flow.credentials
     token_data = {'token': creds.token, 'refresh_token': creds.refresh_token, 'token_uri': creds.token_uri, 'client_id': creds.client_id, 'client_secret': creds.client_secret, 'scopes': creds.scopes}
     oauth_flow = None
-    return web.Response(text=f"SUCCESS! Render Env Var GOOGLE_OAUTH_TOKEN:\n\n{json.dumps(token_data)}")
+    return web.Response(text=f"SUCCESS! Copy & Paste in Render as GOOGLE_OAUTH_TOKEN:\n\n{json.dumps(token_data)}")
 
 async def start_web_server():
     app_web = web.Application()
