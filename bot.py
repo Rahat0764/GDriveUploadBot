@@ -33,12 +33,7 @@ def home():
 
 def run_web_server():
     port = int(os.environ.get("PORT", 8080))
-    # Flask needs to run in a separate thread but must not block
     app_web.run(host="0.0.0.0", port=port, use_reloader=False)
-
-# Start web server in a background thread immediately
-web_thread = threading.Thread(target=run_web_server, daemon=True)
-web_thread.start()
 
 # Telegram Bot Initialization
 app = Client(
@@ -92,7 +87,7 @@ async def update_progress(current, total, msg, start_time, action_text):
         try:
             await msg.edit_text(text)
         except Exception:
-            pass # Ignore minor edit errors
+            pass 
 
 async def upload_to_drive_async(file_path, file_name, msg):
     """Uploads file to Drive asynchronously, updating progress."""
@@ -111,7 +106,6 @@ async def upload_to_drive_async(file_path, file_name, msg):
         start_time = time.time()
         
         while response is None:
-            # Run the blocking upload chunk in a separate thread
             status, response = await asyncio.to_thread(request.next_chunk)
             if status:
                 await update_progress(
@@ -213,5 +207,16 @@ async def handle_links(client, message):
         await msg.edit_text(f"❌ Error handling link: {e}")
 
 if __name__ == "__main__":
+    print("Starting Flask web server...")
+    threading.Thread(target=run_web_server, daemon=True).start()
+    
+    print("Setting up asyncio event loop...")
+    # Fix for Python 3.10+ event loop RuntimeError
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
     print("Bot is starting...")
     app.run()
