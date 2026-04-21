@@ -1,7 +1,9 @@
 import os
+import sys
 import json
 import time
 import asyncio
+import logging
 import aiohttp
 from aiohttp import web
 from pyrogram import Client, filters, idle
@@ -9,41 +11,70 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
-# Environment Variables
-API_ID_STR = os.environ.get("API_ID")
-API_ID = int(API_ID_STR) if API_ID_STR and API_ID_STR.isdigit() else None
-API_HASH = os.environ.get("API_HASH")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID")
-GOOGLE_CREDS_STR = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
+# ================= LOGGING SETUP =================
+# This forces Render to display all logs properly
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    stream=sys.stdout
+)
+logger = logging.getLogger(__name__)
 
-# Authorized Users Setup
+logger.info("System is booting up... Checking Environment Variables.")
+
+# ================= ENVIRONMENT VARIABLES & VALIDATION =================
+API_ID_STR = os.environ.get("API_ID", "").strip()
+API_HASH = os.environ.get("API_HASH", "").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "").strip()
+GOOGLE_CREDS_STR = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
 AUTH_USERS_STR = os.environ.get("AUTHORIZED_USERS", "")
-AUTHORIZED_USERS = [int(u.strip()) for u in AUTH_USERS_STR.split(",") if u.strip().isdigit()]
 
-# Google Drive API scopes
+# Strict Checking to prevent silent crashes
+if not API_ID_STR or not API_ID_STR.isdigit():
+    logger.error("CRITICAL ERROR: API_ID is missing or invalid in Render Environment Variables!")
+    sys.exit(1)
+
+if not API_HASH:
+    logger.error("CRITICAL ERROR: API_HASH is missing in Render Environment Variables!")
+    sys.exit(1)
+
+if not BOT_TOKEN:
+    logger.error("CRITICAL ERROR: BOT_TOKEN is missing! Make sure the variable name is exactly 'BOT_TOKEN'.")
+    sys.exit(1)
+    
+if not DRIVE_FOLDER_ID:
+    logger.error("CRITICAL ERROR: DRIVE_FOLDER_ID is missing in Render Environment Variables!")
+    sys.exit(1)
+    
+if not GOOGLE_CREDS_STR:
+    logger.error("CRITICAL ERROR: GOOGLE_CREDENTIALS_JSON is missing in Render Environment Variables!")
+    sys.exit(1)
+
+API_ID = int(API_ID_STR)
+AUTHORIZED_USERS = [int(u.strip()) for u in AUTH_USERS_STR.split(",") if u.strip().isdigit()]
 SCOPES = ['https://www.googleapis.com/auth/drive.file']
 
-# Telegram Bot Initialization
+logger.info("Environment Variables checked successfully. Proceeding...")
+
+# ================= TELEGRAM BOT INITIALIZATION =================
 app = Client(
     "my_drive_bot",
     api_id=API_ID,
     api_hash=API_HASH,
-    bot_token=BOT_TOKEN
+    bot_token=BOT_TOKEN,
+    in_memory=True  # Safest option for Cloud Hosting (prevents SQLite lock)
 )
 
 def get_drive_service():
     """Initializes and returns the Google Drive service."""
     try:
-        if not GOOGLE_CREDS_STR:
-            print("Credentials JSON is missing in Environment Variables.")
-            return None
         creds_dict = json.loads(GOOGLE_CREDS_STR)
         creds = service_account.Credentials.from_service_account_info(
             creds_dict, scopes=SCOPES)
         return build('drive', 'v3', credentials=creds)
     except Exception as e:
-        print(f"Credentials Error: {e}")
+        logger.error(f"Google Drive Credentials Error: {e}")
         return None
 
 def format_size(bytes_size):
@@ -59,7 +90,7 @@ async def update_progress(current, total, msg, start_time, action_text):
     if not hasattr(msg, "last_update_time"):
         msg.last_update_time = start_time
 
-    # Update every 3 seconds to avoid FloodWait limits
+    # Update every 3 seconds to avoid Telegram API FloodWait limits
     if (now - msg.last_update_time > 3.0) or (current == total):
         msg.last_update_time = now
         
@@ -106,7 +137,7 @@ async def upload_to_drive_async(file_path, file_name, msg):
                 
         return response.get('id')
     except Exception as e:
-        print(f"Upload error: {e}")
+        logger.error(f"Upload error: {e}")
         return None
 
 def check_auth(user_id):
@@ -115,7 +146,7 @@ def check_auth(user_id):
         return True
     return user_id in AUTHORIZED_USERS
 
-# Message Handlers
+# ================= MESSAGE HANDLERS =================
 
 @app.on_message(filters.command("start"))
 async def start_command(client, message):
@@ -154,6 +185,7 @@ async def handle_files(client, message):
             os.remove(file_path)
             
     except Exception as e:
+        logger.error(f"Telegram file error: {e}")
         await msg.edit_text(f"❌ An error occurred: {e}")
 
 @app.on_message(filters.regex(r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+"))
@@ -196,30 +228,40 @@ async def handle_links(client, message):
             os.remove(file_path)
             
     except Exception as e:
+        logger.error(f"Link download error: {e}")
         await msg.edit_text(f"❌ Error handling link: {e}")
 
-# ================= MAIN RUNNER =================
-async def main():
-    print("Starting web server...")
+# ================= WEB SERVER =================
+async def start_web_server():
+    """Starts a lightweight aiohttp web server for UptimeRobot."""
+    async def handle(request):
+        return web.Response(text="Bot is perfectly running 24/7!")
+        
     app_web = web.Application()
-    app_web.router.add_get('/', lambda r: web.Response(text="Bot is perfectly running 24/7!"))
+    app_web.router.add_get('/', handle)
     runner = web.AppRunner(app_web)
     await runner.setup()
-    
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    print(f"Web server started on port {port}")
+    logger.info(f"Web server started successfully on port {port}")
 
-    print("Starting Pyrogram Bot...")
+# ================= MAIN RUNNER =================
+async def main():
+    logger.info("Initializing Web Server...")
+    await start_web_server()
+    
+    logger.info("Starting Pyrogram Bot...")
     await app.start()
-    print("Bot is successfully running!")
+    logger.info("Bot is SUCCESSFULLY running! ✅ All Set!")
     
-    # Keeps the script running to receive updates
     await idle()
-    
     await app.stop()
 
 if __name__ == "__main__":
-    # Python 3.10+ / 3.14 safe asyncio runner
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user.")
+    except Exception as e:
+        logger.error(f"FATAL ERROR in main loop: {e}")
