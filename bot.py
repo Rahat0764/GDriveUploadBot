@@ -8,18 +8,17 @@ import re
 import traceback
 import functools
 
-# ================= CRITICAL FIX FOR PYTHON 3.14+ =================
 try:
     asyncio.get_event_loop()
 except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
-# =================================================================
 
 import aiohttp
 from aiohttp import web
 from pyrogram import Client, filters, idle
 from pyrogram.errors import MessageNotModified
-from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
@@ -31,30 +30,30 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ================= ENVIRONMENT VARIABLES & VALIDATION =================
+# ================= ENVIRONMENT VARIABLES =================
 API_ID_STR = os.environ.get("API_ID", "").strip()
 API_HASH = os.environ.get("API_HASH", "").strip()
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "").strip()
-GOOGLE_CREDS_STR = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
-AUTH_USERS_STR = os.environ.get("AUTHORIZED_USERS", "")
 
-if not all([API_ID_STR, API_HASH, BOT_TOKEN, DRIVE_FOLDER_ID, GOOGLE_CREDS_STR]):
-    logger.error("CRITICAL ERROR: One or more Environment Variables are missing!")
+# New OAuth Variables
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
+GOOGLE_OAUTH_TOKEN = os.environ.get("GOOGLE_OAUTH_TOKEN", "").strip()
+
+AUTH_USERS_STR = os.environ.get("AUTHORIZED_USERS", "")
+RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://gdriveuploadbot.onrender.com")
+
+os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = '1'
+
+if not all([API_ID_STR, API_HASH, BOT_TOKEN, DRIVE_FOLDER_ID, GOOGLE_CLIENT_SECRET]):
+    logger.error("CRITICAL ERROR: API keys or GOOGLE_CLIENT_SECRET is missing!")
     sys.exit(1)
 
 API_ID = int(API_ID_STR) if API_ID_STR.isdigit() else 0
 AUTHORIZED_USERS = [int(u.strip()) for u in AUTH_USERS_STR.split(",") if u.strip().isdigit()]
 SCOPES = ['https://www.googleapis.com/auth/drive']
 
-# Extract Service Account Email for user guidance
-try:
-    creds_dict = json.loads(GOOGLE_CREDS_STR)
-    SA_EMAIL = creds_dict.get('client_email', 'your-service-account-email')
-except:
-    SA_EMAIL = "Invalid JSON"
-
-# ================= TELEGRAM BOT INITIALIZATION =================
+# ================= TELEGRAM BOT =================
 app = Client(
     "my_drive_bot",
     api_id=API_ID,
@@ -64,25 +63,23 @@ app = Client(
 )
 
 def get_drive_service():
-    """Initializes and returns the Google Drive service."""
+    """Returns Drive service using user's real account (OAuth)"""
+    if not GOOGLE_OAUTH_TOKEN:
+        return False, f"⚠️ Bot is not authenticated yet!\nPlease visit:\n{RENDER_URL}/login\nto link your Google Drive."
+        
     try:
-        credentials_dict = json.loads(GOOGLE_CREDS_STR)
-        creds = service_account.Credentials.from_service_account_info(
-            credentials_dict, scopes=SCOPES)
+        creds_data = json.loads(GOOGLE_OAUTH_TOKEN)
+        creds = Credentials.from_authorized_user_info(creds_data, SCOPES)
         return True, build('drive', 'v3', credentials=creds)
     except Exception as e:
-        error_msg = f"Credentials parsing error: {str(e)}"
-        logger.error(error_msg)
-        return False, error_msg
+        return False, f"OAuth Token Error: {str(e)}"
 
 def format_size(bytes_size):
-    """Formats bytes to MB or GB."""
     if bytes_size >= 1024 * 1024 * 1024:
         return f"{bytes_size / (1024 * 1024 * 1024):.2f} GB"
     return f"{bytes_size / (1024 * 1024):.2f} MB"
 
 def format_time(seconds):
-    """Formats seconds to HH:MM:SS format."""
     seconds = int(seconds)
     m, s = divmod(seconds, 60)
     h, m = divmod(m, 60)
@@ -91,34 +88,23 @@ def format_time(seconds):
     return f"{s}s"
 
 def get_safe_error(e):
-    """Sanitizes the error string so Telegram doesn't hide it as HTML tags."""
     err_str = str(e)
-    if not err_str.strip():
-        err_str = repr(e)
-    # Remove HTML-like tags and markdown elements that crash Telegram formatting
+    if not err_str.strip(): err_str = repr(e)
     for char in ['<', '>', '`', '*', '_', '[', ']']:
         err_str = err_str.replace(char, '')
-    return err_str[:800] # Limit length
+    return err_str[:800]
 
 async def update_progress(current, total, msg, start_time, action_text):
-    """Updates the progress message with visual bar, speed, and ETA."""
-    if total == 0:
-        return
-
+    if total == 0: return
     now = time.time()
-    if not hasattr(msg, "last_update_time"):
-        msg.last_update_time = start_time
-    if not hasattr(msg, "last_text"):
-        msg.last_text = ""
+    if not hasattr(msg, "last_update_time"): msg.last_update_time = start_time
+    if not hasattr(msg, "last_text"): msg.last_text = ""
 
-    # 3 seconds delay to avoid Telegram FloodWait limits
     if (now - msg.last_update_time > 3.0) or (current == total):
         msg.last_update_time = now
-        
         percent = (current / total) * 100
         filled = int(percent / 10)
         bar = "🟩" * filled + "🟥" * (10 - filled)
-        
         elapsed = now - start_time
         speed = current / elapsed if elapsed > 0 else 0
         eta = (total - current) / speed if speed > 0 else 0
@@ -137,43 +123,32 @@ async def update_progress(current, total, msg, start_time, action_text):
                 msg.last_text = text
             except MessageNotModified:
                 pass
-            except Exception as e:
-                logger.warning(f"Progress update warning: {e}")
 
 async def upload_to_drive_async(file_path, file_name, msg):
-    """Uploads file to Drive asynchronously with retries for large files."""
     try:
         success, service_or_error = get_drive_service()
-        if not success:
-            return False, service_or_error
+        if not success: return False, service_or_error
             
         service = service_or_error
         file_size = os.path.getsize(file_path)
         file_metadata = {'name': file_name, 'parents': [DRIVE_FOLDER_ID]}
         
-        # INCREASED CHUNK SIZE TO 20MB for faster and stable uploads
         media = MediaFileUpload(file_path, chunksize=20*1024*1024, resumable=True)
-        request = service.files().create(body=file_metadata, media_body=media, fields='id', supportsAllDrives=True)
+        request = service.files().create(body=file_metadata, media_body=media, fields='id')
         
         response = None
         start_time = time.time()
         
         while response is None:
-            # ADDED NUM_RETRIES=5 to fix network drops and BrokenPipe errors
             status, response = await asyncio.to_thread(functools.partial(request.next_chunk, num_retries=5))
             if status:
-                await update_progress(
-                    status.resumable_progress, file_size, msg, start_time, "☁️ Uploading to Google Drive..."
-                )
+                await update_progress(status.resumable_progress, file_size, msg, start_time, "☁️ Uploading to Google Drive...")
                 
         return True, response.get('id')
     except Exception as e:
-        error_details = traceback.format_exc()
-        logger.error(f"Upload error: {error_details}")
         return False, get_safe_error(e)
 
 def extract_gdrive_id(url):
-    """Extracts File ID from Google Drive link."""
     match = re.search(r"/d/([a-zA-Z0-9_-]+)", url)
     if match: return match.group(1)
     match = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", url)
@@ -181,22 +156,18 @@ def extract_gdrive_id(url):
     return None
 
 async def clone_gdrive_file(file_id):
-    """Clones a Google Drive file directly server-side."""
     try:
         success, service_or_error = get_drive_service()
-        if not success:
-            return False, service_or_error
+        if not success: return False, service_or_error
             
         service = service_or_error
         body = {'parents': [DRIVE_FOLDER_ID]}
         
         response = await asyncio.to_thread(
-            lambda: service.files().copy(fileId=file_id, body=body, fields='id, name', supportsAllDrives=True).execute()
+            lambda: service.files().copy(fileId=file_id, body=body, fields='id, name').execute()
         )
         return True, response
     except Exception as e:
-        error_details = traceback.format_exc()
-        logger.error(f"GDrive Clone error: {error_details}")
         return False, get_safe_error(e)
 
 def check_auth(user_id):
@@ -208,19 +179,21 @@ def check_auth(user_id):
 @app.on_message(filters.command("start"))
 async def start_command(client, message):
     if not check_auth(message.from_user.id):
-        await message.reply_text("⛔ You are not authorized to use this bot.")
+        await message.reply_text("⛔ You are not authorized.")
         return
         
-    await message.reply_text(
-        "Hello! 👋\n"
-        "Send me any file, direct download link, or Google Drive link.\n"
-        "- Normal links/files will be downloaded & uploaded.\n"
-        "- GDrive links will be directly cloned instantly!"
-    )
+    if not GOOGLE_OAUTH_TOKEN:
+        await message.reply_text(f"⚠️ Google Drive is NOT connected!\n\nPlease open this link in your browser to login:\n{RENDER_URL}/login\n\nAfter logging in, copy the text and paste it in Render as `GOOGLE_OAUTH_TOKEN`.")
+        return
+        
+    await message.reply_text("Hello! 👋\nSend me any file, direct download link, or Google Drive link.\n- Normal links/files will be downloaded & uploaded.\n- GDrive links will be directly cloned instantly!")
 
 @app.on_message(filters.document | filters.video | filters.audio | filters.photo)
 async def handle_files(client, message):
     if not check_auth(message.from_user.id): return
+    if not GOOGLE_OAUTH_TOKEN:
+        await message.reply_text(f"⚠️ Please authenticate first: {RENDER_URL}/login")
+        return
 
     msg = await message.reply_text("📥 Preparing to download...")
     start_time = time.time()
@@ -238,14 +211,10 @@ async def handle_files(client, message):
         file_name = os.path.basename(file_path)
         success, result = await upload_to_drive_async(file_path, file_name, msg)
         
-        if success:
-            await msg.edit_text(f"✅ Upload Complete!\n\n📄 File: {file_name}")
-        else:
-            # Parse mode removed to prevent hiding errors
-            await msg.edit_text(f"❌ Upload failed.\n\n⚠️ Error Reason:\n{result}")
+        if success: await msg.edit_text(f"✅ Upload Complete!\n\n📄 File: {file_name}")
+        else: await msg.edit_text(f"❌ Upload failed.\n\n⚠️ Reason:\n{result}")
             
     except Exception as e:
-        logger.error(f"Telegram file error: {traceback.format_exc()}")
         await msg.edit_text(f"❌ Download Error:\n{get_safe_error(e)}")
     finally:
         if 'file_path' in locals() and file_path and os.path.exists(file_path):
@@ -254,10 +223,12 @@ async def handle_files(client, message):
 @app.on_message(filters.regex(r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+"))
 async def handle_links(client, message):
     if not check_auth(message.from_user.id): return
+    if not GOOGLE_OAUTH_TOKEN:
+        await message.reply_text(f"⚠️ Please authenticate first: {RENDER_URL}/login")
+        return
 
     url = message.text
     
-    # 1. Handle Google Drive Links directly
     if "drive.google.com" in url:
         g_id = extract_gdrive_id(url)
         if g_id:
@@ -267,16 +238,9 @@ async def handle_links(client, message):
                 file_name = result.get('name', 'Unknown Name')
                 await msg.edit_text(f"✅ GDrive Clone Complete (Instant)!\n\n📄 File: {file_name}")
             else:
-                await msg.edit_text(
-                    f"❌ GDrive Clone Failed.\n\n"
-                    f"⚠️ Service Accounts CANNOT copy public links automatically.\n"
-                    f"You MUST share the SOURCE file explicitly as 'Viewer' to this email:\n"
-                    f"📧 {SA_EMAIL}\n\n"
-                    f"Reason:\n{result}"
-                )
+                await msg.edit_text(f"❌ GDrive Clone Failed.\n\nReason:\n{result}")
             return
 
-    # 2. Handle Normal Direct Links
     msg = await message.reply_text("🔗 Link received! Starting download...")
     file_path = None
     
@@ -303,41 +267,75 @@ async def handle_links(client, message):
                             
         success, result = await upload_to_drive_async(file_path, file_name, msg)
         
-        if success:
-            await msg.edit_text(f"✅ Link Upload Complete!\n\n📄 File: {file_name}")
-        else:
-            await msg.edit_text(f"❌ Upload failed.\n\n⚠️ Reason:\n{result}")
+        if success: await msg.edit_text(f"✅ Link Upload Complete!\n\n📄 File: {file_name}")
+        else: await msg.edit_text(f"❌ Upload failed.\n\n⚠️ Reason:\n{result}")
             
     except OSError as e: 
-        logger.error(f"Storage Error: {e}")
-        await msg.edit_text(f"❌ Server Storage Full!\nThe free server doesn't have enough space for this large file.\n\n⚠️ Reason:\n{get_safe_error(e)}")
+        await msg.edit_text(f"❌ Server Storage Full!\n\n⚠️ Reason:\n{get_safe_error(e)}")
     except Exception as e:
-        logger.error(f"Link download error: {traceback.format_exc()}")
         await msg.edit_text(f"❌ Error handling link:\n{get_safe_error(e)}")
     finally:
         if file_path and os.path.exists(file_path):
             os.remove(file_path)
 
-# ================= WEB SERVER =================
+# ================= WEB SERVER (HANDLES OAUTH) =================
+async def handle_home(request):
+    return web.Response(text="Bot is perfectly running! Go to /login to authenticate.")
+
+async def handle_login(request):
+    if not GOOGLE_CLIENT_SECRET:
+        return web.Response(text="Error: GOOGLE_CLIENT_SECRET is missing in Render variables!")
+    try:
+        flow = Flow.from_client_config(json.loads(GOOGLE_CLIENT_SECRET), scopes=SCOPES)
+        # Using https to prevent oauthlib insecure transport errors
+        redirect_uri = f"https://{request.host}/callback"
+        flow.redirect_uri = redirect_uri
+        auth_url, _ = flow.authorization_url(prompt='consent', access_type='offline')
+        return web.HTTPFound(auth_url)
+    except Exception as e:
+        return web.Response(text=f"Login Error: {str(e)}")
+
+async def handle_callback(request):
+    code = request.query.get('code')
+    if not code:
+        return web.Response(text="Error: No authorization code provided.")
+    try:
+        flow = Flow.from_client_config(json.loads(GOOGLE_CLIENT_SECRET), scopes=SCOPES)
+        flow.redirect_uri = f"https://{request.host}/callback"
+        flow.fetch_token(code=code)
+        creds = flow.credentials
+        
+        token_data = {
+            'token': creds.token,
+            'refresh_token': creds.refresh_token,
+            'token_uri': creds.token_uri,
+            'client_id': creds.client_id,
+            'client_secret': creds.client_secret,
+            'scopes': creds.scopes
+        }
+        token_json = json.dumps(token_data)
+        return web.Response(text=f"SUCCESS!\n\nCopy the entire text below and paste it into a NEW Environment Variable named GOOGLE_OAUTH_TOKEN in Render:\n\n{token_json}")
+    except Exception as e:
+        return web.Response(text=f"Callback Error: {str(e)}")
+
 async def start_web_server():
-    async def handle(request):
-        return web.Response(text="Bot is perfectly running 24/7!")
     app_web = web.Application()
-    app_web.router.add_get('/', handle)
+    app_web.router.add_get('/', handle_home)
+    app_web.router.add_get('/login', handle_login)
+    app_web.router.add_get('/callback', handle_callback)
+    
     runner = web.AppRunner(app_web)
     await runner.setup()
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    logger.info(f"Web server started successfully on port {port}")
+    logger.info(f"Web server started on port {port}")
 
 # ================= MAIN RUNNER =================
 async def main():
-    logger.info("Initializing Web Server...")
     await start_web_server()
-    logger.info("Starting Pyrogram Bot...")
     await app.start()
-    logger.info("Bot is SUCCESSFULLY running! ✅ All Set!")
+    logger.info("Bot is SUCCESSFULLY running!")
     await idle()
     await app.stop()
 
@@ -347,5 +345,3 @@ if __name__ == "__main__":
         loop.run_until_complete(main())
     except KeyboardInterrupt:
         logger.info("Bot stopped by user.")
-    except Exception as e:
-        logger.error(f"FATAL ERROR in main loop: {e}")
