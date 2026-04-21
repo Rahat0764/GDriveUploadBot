@@ -220,6 +220,38 @@ async def upload_to_drive_async(file_path, file_name, msg, parent_id=DRIVE_FOLDE
         return True, response.get('id'), file_size, time.time() - start_time
     except Exception as e: return False, get_safe_error(e), 0, 0
 
+# --- গুগল ড্রাইভ আইটেম (ফোল্ডার সহ) ক্লোন লজিক ---
+async def clone_gdrive_item(item_id, is_folder=False, parent_id=DRIVE_FOLDER_ID, msg=None):
+    try:
+        success, service = get_drive_service()
+        if not success: return False, service
+        
+        if not is_folder:
+            body = {'parents': [parent_id]}
+            response = await asyncio.to_thread(lambda: service.files().copy(fileId=item_id, body=body, fields='id, name').execute())
+            BOT_STATS["clones"] += 1
+            return True, response
+        else:
+            original_folder = await asyncio.to_thread(lambda: service.files().get(fileId=item_id, fields='name').execute())
+            new_folder_id = create_gdrive_folder(original_folder.get('name'), parent_id)
+            
+            query = f"'{item_id}' in parents and trashed=false"
+            results = await asyncio.to_thread(lambda: service.files().list(q=query, fields="nextPageToken, files(id, name, mimeType)", pageSize=1000).execute())
+            items = results.get('files', [])
+            
+            for item in items:
+                if item['mimeType'] == 'application/vnd.google-apps.folder':
+                    if msg: await msg.edit_text(f"🔄 Cloning Sub-folder: `{item['name']}`...")
+                    await clone_gdrive_item(item['id'], is_folder=True, parent_id=new_folder_id, msg=msg)
+                else:
+                    if msg: await msg.edit_text(f"🔄 Cloning File: `{item['name']}`...")
+                    await clone_gdrive_item(item['id'], is_folder=False, parent_id=new_folder_id)
+                    
+            BOT_STATS["clones"] += 1
+            return True, {"name": original_folder.get('name'), "id": new_folder_id}
+    except Exception as e:
+        return False, get_safe_error(e)
+
 # --- স্ট্রাকচার অনুযায়ী জিপ এক্সট্র্যাক্ট এবং আপলোড ---
 async def upload_extracted_folder(extract_dir, base_folder_name, parent_id, msg, cancel_id, start_time):
     success, service = get_drive_service()
@@ -303,27 +335,36 @@ async def handle_text_input(client, message):
 
     if not re.match(r"http[s]?://", url): return
 
-    # --- ড্রাইভ লিংক ম্যানেজমেন্ট ---
+    # --- ড্রাইভ লিংক ম্যানেজমেন্ট (Bug Fixed) ---
     g_id, is_folder = extract_gdrive_id(url)
     if g_id:
         if is_folder:
             msg = await message.reply_text(f"🔄 Cloning Folder to Drive...")
-            success, service = get_drive_service()
-            original = service.files().get(fileId=g_id, fields='name').execute()
-            new_f_id = service.files().create(body={'name': original['name'], 'mimeType': 'application/vnd.google-apps.folder', 'parents': [DRIVE_FOLDER_ID]}, fields='id').execute().get('id')
-            await msg.edit_text(f"✅ GDrive Folder Created!\nName: `{original['name']}`\n[Open Folder](https://drive.google.com/drive/folders/{new_f_id})")
+            try:
+                # ফোল্ডার ডিপ ক্লোনিং ফাংশন কল করা হচ্ছে
+                success, result = await clone_gdrive_item(g_id, is_folder=True, msg=msg)
+                if success:
+                    await msg.edit_text(f"✅ GDrive Folder Cloned Successfully!\nName: `{result['name']}`\n[Open Folder](https://drive.google.com/drive/folders/{result['id']})")
+                else:
+                    await msg.edit_text(f"❌ GDrive Clone Failed.\nMake sure the folder is public and accessible.")
+            except Exception as e:
+                await msg.edit_text("❌ **Folder Not Found or Private!**\nMake sure the URL is correct.")
             return
         else:
             msg = await message.reply_text("🔍 Fetching GDrive File Info...")
-            success, service = get_drive_service()
-            meta = service.files().get(fileId=g_id, fields='name, size').execute()
-            name, size = meta.get('name', 'Unknown'), int(meta.get('size', 0))
-            
-            LINK_CACHE[message.id] = {"url": url, "name": name, "is_gd": True, "gd_id": g_id, "gd_size": size}
-            btns = [[InlineKeyboardButton("🔄 Clone Now", callback_data=f"dl_now|{message.id}"), InlineKeyboardButton("✏️ Rename & Clone", callback_data=f"dl_ren|{message.id}")]]
-            if name.lower().endswith('.zip'): btns.append([InlineKeyboardButton("📦 Clone & Extract", callback_data=f"dl_ext|{message.id}")])
-            
-            await msg.edit_text(f"🔗 **GDrive File Detected!**\n📄 Name: `{name}`\n📦 Size: `{format_size(size)}`\n\nSelect action:", reply_markup=InlineKeyboardMarkup(btns))
+            try:
+                success, service = get_drive_service()
+                meta = await asyncio.to_thread(lambda: service.files().get(fileId=g_id, fields='name, size').execute())
+                name, size = meta.get('name', 'Unknown'), int(meta.get('size', 0))
+                
+                LINK_CACHE[message.id] = {"url": url, "name": name, "is_gd": True, "gd_id": g_id, "gd_size": size}
+                btns = [[InlineKeyboardButton("🔄 Clone Now", callback_data=f"dl_now|{message.id}"), InlineKeyboardButton("✏️ Rename & Clone", callback_data=f"dl_ren|{message.id}")]]
+                if name.lower().endswith('.zip'): btns.append([InlineKeyboardButton("📦 Clone & Extract", callback_data=f"dl_ext|{message.id}")])
+                
+                await msg.edit_text(f"🔗 **GDrive File Detected!**\n📄 Name: `{name}`\n📦 Size: `{format_size(size)}`\n\nSelect action:", reply_markup=InlineKeyboardMarkup(btns))
+            except Exception as e:
+                # ফাইল না থাকলে বা প্রাইভেট হলে এখানে ধরবে
+                await msg.edit_text("❌ **File Not Found or Access Denied!**\nPlease make sure the GDrive link is public and the file exists.")
             return
 
     # --- ডিরেক্ট লিংক ম্যানেজমেন্ট ---
@@ -366,14 +407,12 @@ async def process_download(client, message, url, file_name, extract=False):
                 supports_range = False
                 total_size = link_data.get("size", 0)
                 
-                # Range সাপোর্ট চেক করা হচ্ছে
                 try:
                     async with session.head(url, allow_redirects=True) as head_resp:
                         supports_range = head_resp.headers.get('Accept-Ranges') == 'bytes'
                         if total_size == 0: total_size = int(head_resp.headers.get('content-length', 0))
                 except: pass
 
-                # যদি সাপোর্ট করে এবং ফাইল ২০ এমবির বড় হয়, তবে 4x কানেকশন ব্যবহার করা হবে
                 if supports_range and total_size > 20 * 1024 * 1024:
                     num_parts = 4
                     part_size = total_size // num_parts
@@ -386,7 +425,7 @@ async def process_download(client, message, url, file_name, extract=False):
                         part_path = f"{file_path}.part{i}"
                         tasks.append(download_part(session, url, start, end, part_path, progress, msg, start_time, cancel_id))
                     
-                    await asyncio.gather(*tasks) # প্যারালাল এক্সিকিউশন
+                    await asyncio.gather(*tasks) 
                     
                     if CANCEL_FLAGS.get(cancel_id): raise Exception("CANCELLED")
                     
@@ -398,12 +437,11 @@ async def process_download(client, message, url, file_name, extract=False):
                                 shutil.copyfileobj(infile, outfile)
                             os.remove(part_path)
                 else:
-                    # যদি সাপোর্ট না করে, তবে ফাস্ট সিঙ্গেল কানেকশন ব্যবহার করা হবে
                     async with session.get(url) as response:
                         response.raise_for_status()
                         downloaded = 0
                         with open(file_path, 'wb', buffering=10*1024*1024) as f:
-                            async for chunk in response.content.iter_chunked(8 * 1024 * 1024): # 8MB internal chunk
+                            async for chunk in response.content.iter_chunked(8 * 1024 * 1024): 
                                 if CANCEL_FLAGS.get(cancel_id): raise Exception("CANCELLED")
                                 f.write(chunk)
                                 downloaded += len(chunk)
@@ -451,7 +489,6 @@ async def process_download(client, message, url, file_name, extract=False):
     finally:
         CANCEL_FLAGS.pop(cancel_id, None)
         if file_path and os.path.exists(file_path): os.remove(file_path)
-        # প্রিভিউর টেম্পোরারি পার্টস থাকলে মুছে দেওয়া
         for i in range(4):
             part_p = f"{file_path}.part{i}"
             if os.path.exists(part_p): os.remove(part_p)
