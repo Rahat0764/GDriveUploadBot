@@ -6,6 +6,7 @@ import logging
 import asyncio
 import re
 import traceback
+import functools
 
 # ================= CRITICAL FIX FOR PYTHON 3.14+ =================
 try:
@@ -38,25 +39,20 @@ DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "").strip()
 GOOGLE_CREDS_STR = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
 AUTH_USERS_STR = os.environ.get("AUTHORIZED_USERS", "")
 
-if not API_ID_STR or not API_ID_STR.isdigit():
-    logger.error("CRITICAL ERROR: API_ID is missing or invalid!")
-    sys.exit(1)
-if not API_HASH:
-    logger.error("CRITICAL ERROR: API_HASH is missing!")
-    sys.exit(1)
-if not BOT_TOKEN:
-    logger.error("CRITICAL ERROR: BOT_TOKEN is missing!")
-    sys.exit(1)
-if not DRIVE_FOLDER_ID:
-    logger.error("CRITICAL ERROR: DRIVE_FOLDER_ID is missing!")
-    sys.exit(1)
-if not GOOGLE_CREDS_STR:
-    logger.error("CRITICAL ERROR: GOOGLE_CREDENTIALS_JSON is missing!")
+if not all([API_ID_STR, API_HASH, BOT_TOKEN, DRIVE_FOLDER_ID, GOOGLE_CREDS_STR]):
+    logger.error("CRITICAL ERROR: One or more Environment Variables are missing!")
     sys.exit(1)
 
-API_ID = int(API_ID_STR)
+API_ID = int(API_ID_STR) if API_ID_STR.isdigit() else 0
 AUTHORIZED_USERS = [int(u.strip()) for u in AUTH_USERS_STR.split(",") if u.strip().isdigit()]
 SCOPES = ['https://www.googleapis.com/auth/drive']
+
+# Extract Service Account Email for user guidance
+try:
+    creds_dict = json.loads(GOOGLE_CREDS_STR)
+    SA_EMAIL = creds_dict.get('client_email', 'your-service-account-email')
+except:
+    SA_EMAIL = "Invalid JSON"
 
 # ================= TELEGRAM BOT INITIALIZATION =================
 app = Client(
@@ -70,12 +66,12 @@ app = Client(
 def get_drive_service():
     """Initializes and returns the Google Drive service."""
     try:
-        creds_dict = json.loads(GOOGLE_CREDS_STR)
+        credentials_dict = json.loads(GOOGLE_CREDS_STR)
         creds = service_account.Credentials.from_service_account_info(
-            creds_dict, scopes=SCOPES)
+            credentials_dict, scopes=SCOPES)
         return True, build('drive', 'v3', credentials=creds)
     except Exception as e:
-        error_msg = f"Credentials JSON parsing error: {str(e)}"
+        error_msg = f"Credentials parsing error: {str(e)}"
         logger.error(error_msg)
         return False, error_msg
 
@@ -90,11 +86,19 @@ def format_time(seconds):
     seconds = int(seconds)
     m, s = divmod(seconds, 60)
     h, m = divmod(m, 60)
-    if h > 0:
-        return f"{h}h {m}m {s}s"
-    elif m > 0:
-        return f"{m}m {s}s"
+    if h > 0: return f"{h}h {m}m {s}s"
+    elif m > 0: return f"{m}m {s}s"
     return f"{s}s"
+
+def get_safe_error(e):
+    """Sanitizes the error string so Telegram doesn't hide it as HTML tags."""
+    err_str = str(e)
+    if not err_str.strip():
+        err_str = repr(e)
+    # Remove HTML-like tags and markdown elements that crash Telegram formatting
+    for char in ['<', '>', '`', '*', '_', '[', ']']:
+        err_str = err_str.replace(char, '')
+    return err_str[:800] # Limit length
 
 async def update_progress(current, total, msg, start_time, action_text):
     """Updates the progress message with visual bar, speed, and ETA."""
@@ -107,16 +111,16 @@ async def update_progress(current, total, msg, start_time, action_text):
     if not hasattr(msg, "last_text"):
         msg.last_text = ""
 
+    # 3 seconds delay to avoid Telegram FloodWait limits
     if (now - msg.last_update_time > 3.0) or (current == total):
         msg.last_update_time = now
         
         percent = (current / total) * 100
         filled = int(percent / 10)
-        bar = "🖕" * filled + "✊" * (10 - filled)
+        bar = "🟩" * filled + "🟥" * (10 - filled)
         
         elapsed = now - start_time
         speed = current / elapsed if elapsed > 0 else 0
-        
         eta = (total - current) / speed if speed > 0 else 0
         
         text = (
@@ -127,7 +131,6 @@ async def update_progress(current, total, msg, start_time, action_text):
             f"⏳ ETA: {format_time(eta)}"
         )
         
-        # Only edit if text has actually changed to prevent MESSAGE_NOT_MODIFIED
         if text != msg.last_text:
             try:
                 await msg.edit_text(text)
@@ -138,7 +141,7 @@ async def update_progress(current, total, msg, start_time, action_text):
                 logger.warning(f"Progress update warning: {e}")
 
 async def upload_to_drive_async(file_path, file_name, msg):
-    """Uploads file to Drive asynchronously."""
+    """Uploads file to Drive asynchronously with retries for large files."""
     try:
         success, service_or_error = get_drive_service()
         if not success:
@@ -148,14 +151,16 @@ async def upload_to_drive_async(file_path, file_name, msg):
         file_size = os.path.getsize(file_path)
         file_metadata = {'name': file_name, 'parents': [DRIVE_FOLDER_ID]}
         
-        media = MediaFileUpload(file_path, chunksize=5*1024*1024, resumable=True)
-        request = service.files().create(body=file_metadata, media_body=media, fields='id')
+        # INCREASED CHUNK SIZE TO 20MB for faster and stable uploads
+        media = MediaFileUpload(file_path, chunksize=20*1024*1024, resumable=True)
+        request = service.files().create(body=file_metadata, media_body=media, fields='id', supportsAllDrives=True)
         
         response = None
         start_time = time.time()
         
         while response is None:
-            status, response = await asyncio.to_thread(request.next_chunk)
+            # ADDED NUM_RETRIES=5 to fix network drops and BrokenPipe errors
+            status, response = await asyncio.to_thread(functools.partial(request.next_chunk, num_retries=5))
             if status:
                 await update_progress(
                     status.resumable_progress, file_size, msg, start_time, "☁️ Uploading to Google Drive..."
@@ -165,7 +170,7 @@ async def upload_to_drive_async(file_path, file_name, msg):
     except Exception as e:
         error_details = traceback.format_exc()
         logger.error(f"Upload error: {error_details}")
-        return False, str(e)
+        return False, get_safe_error(e)
 
 def extract_gdrive_id(url):
     """Extracts File ID from Google Drive link."""
@@ -185,20 +190,17 @@ async def clone_gdrive_file(file_id):
         service = service_or_error
         body = {'parents': [DRIVE_FOLDER_ID]}
         
-        # Direct copy execution on Google's servers
         response = await asyncio.to_thread(
-            lambda: service.files().copy(fileId=file_id, body=body, fields='id, name').execute()
+            lambda: service.files().copy(fileId=file_id, body=body, fields='id, name', supportsAllDrives=True).execute()
         )
         return True, response
     except Exception as e:
         error_details = traceback.format_exc()
         logger.error(f"GDrive Clone error: {error_details}")
-        return False, str(e)
+        return False, get_safe_error(e)
 
 def check_auth(user_id):
-    """Checks if the user is authorized to use the bot."""
-    if not AUTHORIZED_USERS:
-        return True
+    if not AUTHORIZED_USERS: return True
     return user_id in AUTHORIZED_USERS
 
 # ================= MESSAGE HANDLERS =================
@@ -218,8 +220,7 @@ async def start_command(client, message):
 
 @app.on_message(filters.document | filters.video | filters.audio | filters.photo)
 async def handle_files(client, message):
-    if not check_auth(message.from_user.id):
-        return
+    if not check_auth(message.from_user.id): return
 
     msg = await message.reply_text("📥 Preparing to download...")
     start_time = time.time()
@@ -235,30 +236,28 @@ async def handle_files(client, message):
             return
             
         file_name = os.path.basename(file_path)
-        
         success, result = await upload_to_drive_async(file_path, file_name, msg)
         
         if success:
-            await msg.edit_text(f"✅ Upload Complete!\n\n📄 File: `{file_name}`")
+            await msg.edit_text(f"✅ Upload Complete!\n\n📄 File: {file_name}")
         else:
-            await msg.edit_text(f"❌ Upload failed.\n\n⚠️ Reason:\n`{result}`")
-            
-        if os.path.exists(file_path):
-            os.remove(file_path)
+            # Parse mode removed to prevent hiding errors
+            await msg.edit_text(f"❌ Upload failed.\n\n⚠️ Error Reason:\n{result}")
             
     except Exception as e:
-        error_details = traceback.format_exc()
-        logger.error(f"Telegram file error: {error_details}")
-        await msg.edit_text(f"❌ Download Error:\n`{str(e)}`")
+        logger.error(f"Telegram file error: {traceback.format_exc()}")
+        await msg.edit_text(f"❌ Download Error:\n{get_safe_error(e)}")
+    finally:
+        if 'file_path' in locals() and file_path and os.path.exists(file_path):
+            os.remove(file_path)
 
 @app.on_message(filters.regex(r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+"))
 async def handle_links(client, message):
-    if not check_auth(message.from_user.id):
-        return
+    if not check_auth(message.from_user.id): return
 
     url = message.text
     
-    # 1. Handle Google Drive Links directly (Clone feature)
+    # 1. Handle Google Drive Links directly
     if "drive.google.com" in url:
         g_id = extract_gdrive_id(url)
         if g_id:
@@ -266,9 +265,15 @@ async def handle_links(client, message):
             success, result = await clone_gdrive_file(g_id)
             if success:
                 file_name = result.get('name', 'Unknown Name')
-                await msg.edit_text(f"✅ GDrive Clone Complete (Instant)!\n\n📄 File: `{file_name}`")
+                await msg.edit_text(f"✅ GDrive Clone Complete (Instant)!\n\n📄 File: {file_name}")
             else:
-                await msg.edit_text(f"❌ GDrive Clone Failed.\n*Note: The file must be 'Anyone with the link can view'.*\n\n⚠️ Reason:\n`{result}`")
+                await msg.edit_text(
+                    f"❌ GDrive Clone Failed.\n\n"
+                    f"⚠️ Service Accounts CANNOT copy public links automatically.\n"
+                    f"You MUST share the SOURCE file explicitly as 'Viewer' to this email:\n"
+                    f"📧 {SA_EMAIL}\n\n"
+                    f"Reason:\n{result}"
+                )
             return
 
     # 2. Handle Normal Direct Links
@@ -299,28 +304,24 @@ async def handle_links(client, message):
         success, result = await upload_to_drive_async(file_path, file_name, msg)
         
         if success:
-            await msg.edit_text(f"✅ Link Upload Complete!\n\n📄 File: `{file_name}`")
+            await msg.edit_text(f"✅ Link Upload Complete!\n\n📄 File: {file_name}")
         else:
-            await msg.edit_text(f"❌ Upload failed.\n\n⚠️ Reason:\n`{result}`")
+            await msg.edit_text(f"❌ Upload failed.\n\n⚠️ Reason:\n{result}")
             
-    except OSError as e: # Catch "Disk Full" errors specifically
+    except OSError as e: 
         logger.error(f"Storage Error: {e}")
-        await msg.edit_text(f"❌ Server Storage Full!\nThe free server doesn't have enough space for this large file.\n\n⚠️ Detailed Reason:\n`{str(e)}`")
+        await msg.edit_text(f"❌ Server Storage Full!\nThe free server doesn't have enough space for this large file.\n\n⚠️ Reason:\n{get_safe_error(e)}")
     except Exception as e:
-        error_details = traceback.format_exc()
-        logger.error(f"Link download error: {error_details}")
-        await msg.edit_text(f"❌ Error handling link:\n`{str(e)}`")
+        logger.error(f"Link download error: {traceback.format_exc()}")
+        await msg.edit_text(f"❌ Error handling link:\n{get_safe_error(e)}")
     finally:
-        # Always cleanup to prevent disk full issues
         if file_path and os.path.exists(file_path):
             os.remove(file_path)
 
 # ================= WEB SERVER =================
 async def start_web_server():
-    """Starts a lightweight aiohttp web server for UptimeRobot."""
     async def handle(request):
         return web.Response(text="Bot is perfectly running 24/7!")
-        
     app_web = web.Application()
     app_web.router.add_get('/', handle)
     runner = web.AppRunner(app_web)
@@ -334,11 +335,9 @@ async def start_web_server():
 async def main():
     logger.info("Initializing Web Server...")
     await start_web_server()
-    
     logger.info("Starting Pyrogram Bot...")
     await app.start()
     logger.info("Bot is SUCCESSFULLY running! ✅ All Set!")
-    
     await idle()
     await app.stop()
 
