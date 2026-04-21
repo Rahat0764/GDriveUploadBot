@@ -82,7 +82,7 @@ Unlike basic Service Accounts (which lack storage quota), this bot uses **OAuth 
 To enable the lightning-fast `[Direct Download Link]`:
 1. Go to [Cloudflare Workers](https://dash.cloudflare.com/?to=/:account/workers).
 2. Create a new Worker (e.g., `gdrive-index`).
-3. Copy the raw JavaScript code of GoIndex and paste it into your Worker's editor.
+3. Copy the raw JavaScript code from [here](https://github.com/Rahat0764/GDriveUploadBot/blob/main/workers_demo.js) and paste it into your Worker's editor.
 4. Replace the `client_id`, `client_secret`, `refresh_token`, and `folder_id` at the top of the script.
 5. Deploy the worker and copy its `*.workers.dev` URL to the bot's `CF_WORKER_URL` variable.
 
@@ -105,7 +105,7 @@ logs - View recent system logs for debugging
 
 Crafted with ❤️ by **Rahat Ahmed**.
 
-- 💼 **LinkedIn:** [linkedin.com/in/RahatAhmedX](https://www.linkedin.com/in/RahatAhmedX)
+- 💼 **LinkedIn:** [Rahat Ahmed](https://www.linkedin.com/in/RahatAhmedX)
 - 🐙 **GitHub:** [Rahat0764](https://github.com/Rahat0764)
 
 *If you found this project helpful, don't forget to ⭐ star the repository!*
