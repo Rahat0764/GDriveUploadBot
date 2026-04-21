@@ -1,3 +1,5 @@
+// COPY THE WHOLE CODE
+
 // =======Options START=======
 var authConfig = {
   siteName: "Rahat's Cloud", // Website Name
