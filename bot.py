@@ -26,6 +26,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+from googleapiclient.errors import HttpError
 
 # ভিডিও প্রসেসিং লাইব্রেরি চেক করা হচ্ছে
 try:
@@ -213,7 +214,9 @@ async def upload_to_drive_async(file_path, file_name, msg, parent_id=DRIVE_FOLDE
         while response is None:
             if cancel_id and CANCEL_FLAGS.get(cancel_id): raise Exception("CANCELLED")
             status, response = await asyncio.to_thread(functools.partial(request.next_chunk, num_retries=5))
-            if status: await update_progress(status.resumable_progress(), file_size, msg, start_time, "☁️ Uploading to Drive...", cancel_id)
+            if status: 
+                # BUG FIX: status.resumable_progress is a property, not a function!
+                await update_progress(status.resumable_progress, file_size, msg, start_time, "☁️ Uploading to Drive...", cancel_id)
                 
         BOT_STATS["uploads"] += 1
         BOT_STATS["bytes_uploaded"] += file_size
@@ -252,6 +255,13 @@ async def clone_gdrive_item(item_id, is_folder=False, parent_id=DRIVE_FOLDER_ID,
     except Exception as e:
         return False, get_safe_error(e)
 
+def create_gdrive_folder(folder_name, parent_id=DRIVE_FOLDER_ID):
+    success, service = get_drive_service()
+    if not success: return None
+    metadata = {'name': folder_name, 'mimeType': 'application/vnd.google-apps.folder', 'parents': [parent_id]}
+    folder = service.files().create(body=metadata, fields='id').execute()
+    return folder.get('id')
+
 # --- স্ট্রাকচার অনুযায়ী জিপ এক্সট্র্যাক্ট এবং আপলোড ---
 async def upload_extracted_folder(extract_dir, base_folder_name, parent_id, msg, cancel_id, start_time):
     success, service = get_drive_service()
@@ -275,6 +285,18 @@ async def upload_extracted_folder(extract_dir, base_folder_name, parent_id, msg,
             if up_success: total_files += 1
     return total_files, base_g_id
 
+def extract_zip(zip_path, extract_dir):
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(extract_dir)
+        return True, "Success"
+    except RuntimeError as e:
+        if 'password' in str(e).lower() or 'encrypted' in str(e).lower():
+            return False, "This ZIP is password protected and cannot be extracted."
+        return False, str(e)
+    except Exception as e:
+        return False, str(e)
+
 # --- ড্রাইভ ফাইল সার্ভারে ডাউনলোড ---
 async def download_gdrive_to_server(file_id, file_path, file_size, msg, cancel_id):
     success, service = get_drive_service()
@@ -288,7 +310,8 @@ async def download_gdrive_to_server(file_id, file_path, file_size, msg, cancel_i
             fh.close()
             raise Exception("CANCELLED")
         status, done = await asyncio.to_thread(functools.partial(downloader.next_chunk, num_retries=3))
-        if status: await update_progress(status.resumable_progress(), file_size, msg, start_time, "📥 Downloading from GDrive...", cancel_id)
+        # BUG FIX: status.resumable_progress is a property!
+        if status: await update_progress(status.resumable_progress, file_size, msg, start_time, "📥 Downloading from GDrive...", cancel_id)
     fh.close()
 
 # ================= মেসেজ হ্যান্ডলারস =================
@@ -314,8 +337,11 @@ async def handle_text_input(client, message):
         if is_gd:
             success, service = get_drive_service()
             msg = await message.reply_text(f"🔄 Cloning as `{new_name}`...")
-            res = await asyncio.to_thread(lambda: service.files().copy(fileId=gd_id, body={'name': new_name, 'parents': [DRIVE_FOLDER_ID]}, fields='id').execute())
-            await msg.edit_text(generate_result_text(new_name, res.get('id'), gd_size, 0))
+            try:
+                res = await asyncio.to_thread(lambda: service.files().copy(fileId=gd_id, body={'name': new_name, 'parents': [DRIVE_FOLDER_ID]}, fields='id').execute())
+                await msg.edit_text(generate_result_text(new_name, res.get('id'), gd_size, 0))
+            except HttpError as err:
+                 await msg.edit_text(f"❌ **Clone Failed:** Private or inaccessible file.")
         else:
             await process_download(client, message, url, new_name, extract=False)
         return
@@ -335,20 +361,19 @@ async def handle_text_input(client, message):
 
     if not re.match(r"http[s]?://", url): return
 
-    # --- ড্রাইভ লিংক ম্যানেজমেন্ট (Bug Fixed) ---
+    # --- ড্রাইভ লিংক ম্যানেজমেন্ট (Private Link Bug Fixed) ---
     g_id, is_folder = extract_gdrive_id(url)
     if g_id:
         if is_folder:
-            msg = await message.reply_text(f"🔄 Cloning Folder to Drive...")
+            msg = await message.reply_text(f"🔄 Fetching Folder details...")
             try:
-                # ফোল্ডার ডিপ ক্লোনিং ফাংশন কল করা হচ্ছে
                 success, result = await clone_gdrive_item(g_id, is_folder=True, msg=msg)
                 if success:
                     await msg.edit_text(f"✅ GDrive Folder Cloned Successfully!\nName: `{result['name']}`\n[Open Folder](https://drive.google.com/drive/folders/{result['id']})")
                 else:
-                    await msg.edit_text(f"❌ GDrive Clone Failed.\nMake sure the folder is public and accessible.")
+                    await msg.edit_text(f"❌ **Access Denied or Folder Not Found!**\nMake sure the folder is public.")
             except Exception as e:
-                await msg.edit_text("❌ **Folder Not Found or Private!**\nMake sure the URL is correct.")
+                await msg.edit_text("❌ **Access Denied or Folder Not Found!**\nMake sure the folder is public.")
             return
         else:
             msg = await message.reply_text("🔍 Fetching GDrive File Info...")
@@ -362,9 +387,11 @@ async def handle_text_input(client, message):
                 if name.lower().endswith('.zip'): btns.append([InlineKeyboardButton("📦 Clone & Extract", callback_data=f"dl_ext|{message.id}")])
                 
                 await msg.edit_text(f"🔗 **GDrive File Detected!**\n📄 Name: `{name}`\n📦 Size: `{format_size(size)}`\n\nSelect action:", reply_markup=InlineKeyboardMarkup(btns))
-            except Exception as e:
-                # ফাইল না থাকলে বা প্রাইভেট হলে এখানে ধরবে
+            except HttpError as e:
+                # প্রাইভেট ফাইল হলে এই ব্লকে আসবে
                 await msg.edit_text("❌ **File Not Found or Access Denied!**\nPlease make sure the GDrive link is public and the file exists.")
+            except Exception as e:
+                await msg.edit_text("❌ **File Not Found!**")
             return
 
     # --- ডিরেক্ট লিংক ম্যানেজমেন্ট ---
