@@ -1,7 +1,7 @@
 <h1 align="center">🚀 Ultimate GDrive Uploader & Manager Bot</h1>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/Python-3.14.3-blue.svg?logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/Framework-Pyrogram-purple.svg" alt="Pyrogram">
   <img src="https://img.shields.io/badge/Cloud-Google%20Drive-yellow.svg?logo=googledrive" alt="Google Drive">
   <img src="https://img.shields.io/badge/CDN-Cloudflare%20Workers-orange.svg?logo=cloudflare" alt="Cloudflare">
