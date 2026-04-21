@@ -44,6 +44,7 @@ AUTH_USERS_STR = os.environ.get("AUTHORIZED_USERS", "")
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://gdriveuploadbot.onrender.com")
 
 os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = '1'
+os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
 
 if not all([API_ID_STR, API_HASH, BOT_TOKEN, DRIVE_FOLDER_ID, GOOGLE_CLIENT_SECRET]):
     logger.error("CRITICAL ERROR: API keys or GOOGLE_CLIENT_SECRET is missing!")
@@ -52,6 +53,9 @@ if not all([API_ID_STR, API_HASH, BOT_TOKEN, DRIVE_FOLDER_ID, GOOGLE_CLIENT_SECR
 API_ID = int(API_ID_STR) if API_ID_STR.isdigit() else 0
 AUTHORIZED_USERS = [int(u.strip()) for u in AUTH_USERS_STR.split(",") if u.strip().isdigit()]
 SCOPES = ['https://www.googleapis.com/auth/drive']
+
+# Global flow object to store the PKCE code verifier
+oauth_flow = None
 
 # ================= TELEGRAM BOT =================
 app = Client(
@@ -63,7 +67,6 @@ app = Client(
 )
 
 def get_drive_service():
-    """Returns Drive service using user's real account (OAuth)"""
     if not GOOGLE_OAUTH_TOKEN:
         return False, f"⚠️ Bot is not authenticated yet!\nPlease visit:\n{RENDER_URL}/login\nto link your Google Drive."
         
@@ -283,27 +286,30 @@ async def handle_home(request):
     return web.Response(text="Bot is perfectly running! Go to /login to authenticate.")
 
 async def handle_login(request):
+    global oauth_flow
     if not GOOGLE_CLIENT_SECRET:
         return web.Response(text="Error: GOOGLE_CLIENT_SECRET is missing in Render variables!")
     try:
-        flow = Flow.from_client_config(json.loads(GOOGLE_CLIENT_SECRET), scopes=SCOPES)
-        # Using https to prevent oauthlib insecure transport errors
+        oauth_flow = Flow.from_client_config(json.loads(GOOGLE_CLIENT_SECRET), scopes=SCOPES)
         redirect_uri = f"https://{request.host}/callback"
-        flow.redirect_uri = redirect_uri
-        auth_url, _ = flow.authorization_url(prompt='consent', access_type='offline')
+        oauth_flow.redirect_uri = redirect_uri
+        auth_url, _ = oauth_flow.authorization_url(prompt='consent', access_type='offline')
         return web.HTTPFound(auth_url)
     except Exception as e:
         return web.Response(text=f"Login Error: {str(e)}")
 
 async def handle_callback(request):
+    global oauth_flow
     code = request.query.get('code')
     if not code:
         return web.Response(text="Error: No authorization code provided.")
+    if not oauth_flow:
+        return web.Response(text="Error: Session expired. Please go back to /login and try again.")
+        
     try:
-        flow = Flow.from_client_config(json.loads(GOOGLE_CLIENT_SECRET), scopes=SCOPES)
-        flow.redirect_uri = f"https://{request.host}/callback"
-        flow.fetch_token(code=code)
-        creds = flow.credentials
+        # Fetch token using the SAME flow object to maintain the code_verifier
+        oauth_flow.fetch_token(code=code)
+        creds = oauth_flow.credentials
         
         token_data = {
             'token': creds.token,
@@ -314,6 +320,10 @@ async def handle_callback(request):
             'scopes': creds.scopes
         }
         token_json = json.dumps(token_data)
+        
+        # Clear flow from memory after success
+        oauth_flow = None 
+        
         return web.Response(text=f"SUCCESS!\n\nCopy the entire text below and paste it into a NEW Environment Variable named GOOGLE_OAUTH_TOKEN in Render:\n\n{token_json}")
     except Exception as e:
         return web.Response(text=f"Callback Error: {str(e)}")
@@ -333,9 +343,11 @@ async def start_web_server():
 
 # ================= MAIN RUNNER =================
 async def main():
+    logger.info("Initializing Web Server...")
     await start_web_server()
+    logger.info("Starting Pyrogram Bot...")
     await app.start()
-    logger.info("Bot is SUCCESSFULLY running!")
+    logger.info("Bot is SUCCESSFULLY running! ✅ All Set!")
     await idle()
     await app.stop()
 
@@ -345,3 +357,5 @@ if __name__ == "__main__":
         loop.run_until_complete(main())
     except KeyboardInterrupt:
         logger.info("Bot stopped by user.")
+    except Exception as e:
+        logger.error(f"FATAL ERROR in main loop: {e}")
