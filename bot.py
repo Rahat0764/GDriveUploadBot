@@ -9,6 +9,7 @@ import traceback
 import functools
 import zipfile
 import shutil
+import urllib.parse
 
 try:
     asyncio.get_event_loop()
@@ -43,7 +44,7 @@ GOOGLE_OAUTH_TOKEN = os.environ.get("GOOGLE_OAUTH_TOKEN", "").strip()
 AUTH_USERS_STR = os.environ.get("AUTHORIZED_USERS", "")
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://gdriveuploadbot.onrender.com")
 
-# Optional: Cloudflare Worker URL for Direct Links (e.g., https://myindex.worker.dev)
+# Cloudflare GoIndex URL (e.g., https://gdrive.rahatx.workers.dev)
 CF_WORKER_URL = os.environ.get("CF_WORKER_URL", "").strip().rstrip('/')
 
 os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = '1'
@@ -60,8 +61,8 @@ SCOPES = ['https://www.googleapis.com/auth/drive']
 oauth_flow = None
 
 # Caching structures for interactive operations
-LINK_CACHE = {}  # {msg_id: {"url": str, "name": str}}
-USER_STATES = {} # {user_id: {"action": str, "data": any}}
+LINK_CACHE = {}  
+USER_STATES = {} 
 
 # ================= TELEGRAM BOT =================
 app = Client(
@@ -130,7 +131,6 @@ async def update_progress(current, total, msg, start_time, action_text):
                 pass
 
 async def upload_to_drive_async(file_path, file_name, msg, parent_id=DRIVE_FOLDER_ID):
-    """Uploads file and returns (Success, File_ID, File_Size, Elapsed_Time)."""
     try:
         success, service = get_drive_service()
         if not success: return False, service, 0, 0
@@ -173,7 +173,6 @@ async def clone_gdrive_item(item_id, is_folder=False, parent_id=DRIVE_FOLDER_ID)
             )
             return True, response
         else:
-            # Recursive Folder Copy Logic
             original_folder = service.files().get(fileId=item_id, fields='name').execute()
             new_folder_id = create_gdrive_folder(original_folder.get('name'), parent_id)
             
@@ -192,7 +191,6 @@ async def clone_gdrive_item(item_id, is_folder=False, parent_id=DRIVE_FOLDER_ID)
         return False, get_safe_error(e)
 
 def extract_zip(zip_path, extract_dir):
-    """Extracts zip and returns True if successful, False if password protected or error."""
     try:
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(extract_dir)
@@ -210,7 +208,7 @@ def extract_gdrive_id(url):
     match = re.search(r"id=([a-zA-Z0-9_-]+)", url)
     if match: return match.group(1)
     match = re.search(r"/folders/([a-zA-Z0-9_-]+)", url)
-    if match: return match.group(1), True # True means it's a folder
+    if match: return match.group(1), True
     return None, False
 
 def check_auth(user_id):
@@ -219,7 +217,10 @@ def check_auth(user_id):
 
 def generate_result_text(file_name, file_id, file_size, elapsed_time):
     drive_link = f"https://drive.google.com/file/d/{file_id}/view"
-    direct_link = f"{CF_WORKER_URL}/api/file/{file_id}" if CF_WORKER_URL else "Not Configured (See Guide)"
+    
+    # URL Encode the filename for GoIndex direct link
+    safe_file_name = urllib.parse.quote(file_name)
+    direct_link = f"{CF_WORKER_URL}/{safe_file_name}" if CF_WORKER_URL else "Not Configured"
     
     text = (
         f"✅ **Task Completed Successfully!**\n\n"
@@ -227,7 +228,7 @@ def generate_result_text(file_name, file_id, file_size, elapsed_time):
         f"📦 **Size:** `{format_size(file_size)}`\n"
         f"⏱️ **Time Taken:** `{format_time(elapsed_time)}`\n\n"
         f"🔗 **Google Drive Link:**\n{drive_link}\n\n"
-        f"⚡ **Direct Download Link:**\n{direct_link}"
+        f"⚡ **Direct Download Link (GoIndex):**\n{direct_link}"
     )
     return text
 
@@ -267,7 +268,6 @@ async def myfiles_command(client, message):
         text = "📁 **Recent 10 Files in your Drive:**\n\n"
         for i, item in enumerate(items, 1):
             text += f"{i}. `{item['name']}`\n"
-            # Buttons for rename and delete
             row = [
                 InlineKeyboardButton(f"Rename #{i}", callback_data=f"ren_file|{item['id']}"),
                 InlineKeyboardButton(f"Delete #{i}", callback_data=f"del_file|{item['id']}")
@@ -283,7 +283,6 @@ async def handle_text_input(client, message):
     if not check_auth(message.from_user.id): return
     user_id = message.from_user.id
     
-    # Check if waiting for rename input
     state = USER_STATES.get(user_id)
     if state and state.get("action") == "wait_rename":
         new_name = message.text.strip()
@@ -308,7 +307,6 @@ async def handle_text_input(client, message):
                 await message.reply_text(f"❌ Rename Failed: {get_safe_error(e)}")
         return
 
-    # Regular Link Handling
     url = message.text
     if not re.match(r"http[s]?://", url): return
 
@@ -323,7 +321,6 @@ async def handle_text_input(client, message):
                 await msg.edit_text(f"❌ GDrive Clone Failed.\n\nReason:\n{result}")
             return
 
-    # Store link in cache for inline buttons
     file_name = url.split("/")[-1].split("?")[0]
     if not file_name: file_name = f"download_{int(time.time())}"
     
@@ -347,7 +344,6 @@ async def callback_handler(client, query: CallbackQuery):
     data = query.data.split("|")
     action = data[0]
 
-    # Handle Link Actions
     if action in ["dl_now", "dl_ren", "dl_ext"]:
         msg_id = int(data[1])
         link_data = LINK_CACHE.get(msg_id)
@@ -368,7 +364,6 @@ async def callback_handler(client, query: CallbackQuery):
             USER_STATES[user_id] = {"action": "wait_rename", "url": url}
             await app.send_message(user_id, "Please send the **new name** for the file (including extension like .mp4, .mkv):")
             
-    # Handle GDrive File Management Actions
     elif action == "del_file":
         file_id = data[1]
         success, service = get_drive_service()
@@ -392,7 +387,6 @@ async def process_download(client, message, url, file_name, extract=False):
     start_time = time.time()
     
     try:
-        # Download to server
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as response:
                 response.raise_for_status()
@@ -405,7 +399,6 @@ async def process_download(client, message, url, file_name, extract=False):
                         if total_size > 0:
                             await update_progress(downloaded, total_size, msg, start_time, "📥 Downloading to server...")
                             
-        # Handle Extraction
         if extract and file_name.lower().endswith('.zip'):
             await msg.edit_text("📦 Extracting ZIP file...")
             extract_dir = os.path.join(os.getcwd(), file_name + "_extracted")
@@ -430,14 +423,17 @@ async def process_download(client, message, url, file_name, extract=False):
                     if up_success: total_files_uploaded += 1
                         
             elapsed = time.time() - start_time
-            await msg.edit_text(f"✅ Extraction & Upload Complete!\n\nFolder: `{folder_name}`\nFiles Uploaded: `{total_files_uploaded}`\nTime Taken: `{format_time(elapsed)}`")
             
-            # Cleanup
+            # GoIndex direct link for the new folder
+            safe_folder_name = urllib.parse.quote(folder_name)
+            folder_direct_link = f"{CF_WORKER_URL}/{safe_folder_name}/" if CF_WORKER_URL else "Not Configured"
+            
+            await msg.edit_text(f"✅ **Extraction & Upload Complete!**\n\n📁 **Folder:** `{folder_name}`\n📄 **Files Uploaded:** `{total_files_uploaded}`\n⏱️ **Time Taken:** `{format_time(elapsed)}`\n\n⚡ **Folder Direct Link:**\n{folder_direct_link}")
+            
             os.remove(file_path)
             shutil.rmtree(extract_dir, ignore_errors=True)
             return
 
-        # Normal Upload
         success, file_id, file_size, upload_time = await upload_to_drive_async(file_path, file_name, msg)
         
         if success:
