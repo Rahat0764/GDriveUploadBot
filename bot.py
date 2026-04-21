@@ -2,20 +2,24 @@ import os
 import json
 import time
 import asyncio
-import threading
 import aiohttp
-from flask import Flask
+from aiohttp import web
 from pyrogram import Client, filters
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 # Environment Variables
-API_ID = os.environ.get("API_ID")
+API_ID_STR = os.environ.get("API_ID", "0")
+try:
+    API_ID = int(API_ID_STR)
+except ValueError:
+    API_ID = 0
+
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID")
-GOOGLE_CREDS_STR = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+GOOGLE_CREDS_STR = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
 
 # Authorized Users Setup
 AUTH_USERS_STR = os.environ.get("AUTHORIZED_USERS", "")
@@ -24,21 +28,10 @@ AUTHORIZED_USERS = [int(u.strip()) for u in AUTH_USERS_STR.split(",") if u.strip
 # Google Drive API scopes
 SCOPES = ['https://www.googleapis.com/auth/drive.file']
 
-# Flask Web Server setup
-app_web = Flask(__name__)
-
-@app_web.route('/')
-def home():
-    return "Bot is perfectly running 24/7!"
-
-def run_web_server():
-    port = int(os.environ.get("PORT", 8080))
-    app_web.run(host="0.0.0.0", port=port, use_reloader=False)
-
 # Telegram Bot Initialization
 app = Client(
     "my_drive_bot",
-    api_id=int(API_ID) if API_ID else None,
+    api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN
 )
@@ -206,17 +199,31 @@ async def handle_links(client, message):
     except Exception as e:
         await msg.edit_text(f"❌ Error handling link: {e}")
 
+async def start_web_server():
+    """Starts a lightweight aiohttp web server for UptimeRobot."""
+    async def handle(request):
+        return web.Response(text="Bot is perfectly running 24/7!")
+        
+    app_web = web.Application()
+    app_web.router.add_get('/', handle)
+    runner = web.AppRunner(app_web)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"Web server started on port {port}")
+
 if __name__ == "__main__":
-    print("Starting Flask web server...")
-    threading.Thread(target=run_web_server, daemon=True).start()
-    
-    print("Setting up asyncio event loop...")
-    # Fix for Python 3.10+ event loop RuntimeError
+    print("Starting initialization...")
     try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
+        # Create a single native event loop for both Web Server and Pyrogram
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
-    print("Bot is starting...")
-    app.run()
+        print("Starting web server...")
+        loop.run_until_complete(start_web_server())
+        
+        print("Starting Pyrogram Bot...")
+        app.run()
+    except Exception as e:
+        print(f"CRITICAL ERROR: {e}")
