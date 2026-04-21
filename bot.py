@@ -4,6 +4,8 @@ import json
 import time
 import logging
 import asyncio
+import re
+import traceback
 
 # ================= CRITICAL FIX FOR PYTHON 3.14+ =================
 try:
@@ -15,6 +17,7 @@ except RuntimeError:
 import aiohttp
 from aiohttp import web
 from pyrogram import Client, filters, idle
+from pyrogram.errors import MessageNotModified
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -53,7 +56,7 @@ if not GOOGLE_CREDS_STR:
 
 API_ID = int(API_ID_STR)
 AUTHORIZED_USERS = [int(u.strip()) for u in AUTH_USERS_STR.split(",") if u.strip().isdigit()]
-SCOPES = ['https://www.googleapis.com/auth/drive.file']
+SCOPES = ['https://www.googleapis.com/auth/drive']
 
 # ================= TELEGRAM BOT INITIALIZATION =================
 app = Client(
@@ -77,41 +80,65 @@ def get_drive_service():
         return False, error_msg
 
 def format_size(bytes_size):
-    """Formats bytes to MB."""
+    """Formats bytes to MB or GB."""
+    if bytes_size >= 1024 * 1024 * 1024:
+        return f"{bytes_size / (1024 * 1024 * 1024):.2f} GB"
     return f"{bytes_size / (1024 * 1024):.2f} MB"
 
+def format_time(seconds):
+    """Formats seconds to HH:MM:SS format."""
+    seconds = int(seconds)
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h}h {m}m {s}s"
+    elif m > 0:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
 async def update_progress(current, total, msg, start_time, action_text):
-    """Updates the progress message with a visual bar and speed."""
+    """Updates the progress message with visual bar, speed, and ETA."""
     if total == 0:
         return
 
     now = time.time()
     if not hasattr(msg, "last_update_time"):
         msg.last_update_time = start_time
+    if not hasattr(msg, "last_text"):
+        msg.last_text = ""
 
     if (now - msg.last_update_time > 3.0) or (current == total):
         msg.last_update_time = now
         
         percent = (current / total) * 100
         filled = int(percent / 10)
-        bar = "🟩" * filled + "🟥" * (10 - filled)
+        bar = "🖕" * filled + "✊" * (10 - filled)
         
         elapsed = now - start_time
         speed = current / elapsed if elapsed > 0 else 0
         
+        eta = (total - current) / speed if speed > 0 else 0
+        
         text = (
             f"{action_text}\n\n"
             f"{bar} {percent:.1f}%\n"
-            f"Size: {format_size(current)} / {format_size(total)}\n"
-            f"Speed: {format_size(speed)}/s"
+            f"📦 Size: {format_size(current)} / {format_size(total)}\n"
+            f"🚀 Speed: {format_size(speed)}/s\n"
+            f"⏳ ETA: {format_time(eta)}"
         )
-        try:
-            await msg.edit_text(text)
-        except Exception:
-            pass 
+        
+        # Only edit if text has actually changed to prevent MESSAGE_NOT_MODIFIED
+        if text != msg.last_text:
+            try:
+                await msg.edit_text(text)
+                msg.last_text = text
+            except MessageNotModified:
+                pass
+            except Exception as e:
+                logger.warning(f"Progress update warning: {e}")
 
 async def upload_to_drive_async(file_path, file_name, msg):
-    """Uploads file to Drive asynchronously and returns success status + detail."""
+    """Uploads file to Drive asynchronously."""
     try:
         success, service_or_error = get_drive_service()
         if not success:
@@ -121,7 +148,7 @@ async def upload_to_drive_async(file_path, file_name, msg):
         file_size = os.path.getsize(file_path)
         file_metadata = {'name': file_name, 'parents': [DRIVE_FOLDER_ID]}
         
-        media = MediaFileUpload(file_path, chunksize=2*1024*1024, resumable=True)
+        media = MediaFileUpload(file_path, chunksize=5*1024*1024, resumable=True)
         request = service.files().create(body=file_metadata, media_body=media, fields='id')
         
         response = None
@@ -136,9 +163,37 @@ async def upload_to_drive_async(file_path, file_name, msg):
                 
         return True, response.get('id')
     except Exception as e:
-        error_details = str(e)
+        error_details = traceback.format_exc()
         logger.error(f"Upload error: {error_details}")
-        return False, error_details
+        return False, str(e)
+
+def extract_gdrive_id(url):
+    """Extracts File ID from Google Drive link."""
+    match = re.search(r"/d/([a-zA-Z0-9_-]+)", url)
+    if match: return match.group(1)
+    match = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", url)
+    if match: return match.group(1)
+    return None
+
+async def clone_gdrive_file(file_id):
+    """Clones a Google Drive file directly server-side."""
+    try:
+        success, service_or_error = get_drive_service()
+        if not success:
+            return False, service_or_error
+            
+        service = service_or_error
+        body = {'parents': [DRIVE_FOLDER_ID]}
+        
+        # Direct copy execution on Google's servers
+        response = await asyncio.to_thread(
+            lambda: service.files().copy(fileId=file_id, body=body, fields='id, name').execute()
+        )
+        return True, response
+    except Exception as e:
+        error_details = traceback.format_exc()
+        logger.error(f"GDrive Clone error: {error_details}")
+        return False, str(e)
 
 def check_auth(user_id):
     """Checks if the user is authorized to use the bot."""
@@ -156,7 +211,9 @@ async def start_command(client, message):
         
     await message.reply_text(
         "Hello! 👋\n"
-        "Send me any file or direct download link, and I will upload it to your Google Drive."
+        "Send me any file, direct download link, or Google Drive link.\n"
+        "- Normal links/files will be downloaded & uploaded.\n"
+        "- GDrive links will be directly cloned instantly!"
     )
 
 @app.on_message(filters.document | filters.video | filters.audio | filters.photo)
@@ -172,21 +229,27 @@ async def handle_files(client, message):
             progress=update_progress,
             progress_args=(msg, start_time, "📥 Downloading from Telegram...")
         )
+        
+        if not file_path:
+            await msg.edit_text("❌ Failed to download from Telegram.")
+            return
+            
         file_name = os.path.basename(file_path)
         
         success, result = await upload_to_drive_async(file_path, file_name, msg)
         
         if success:
-            await msg.edit_text(f"✅ Upload Complete!\n\nFile Name: {file_name}")
+            await msg.edit_text(f"✅ Upload Complete!\n\n📄 File: `{file_name}`")
         else:
-            await msg.edit_text(f"❌ Upload failed.\n\n⚠️ Error Reason:\n`{result}`")
+            await msg.edit_text(f"❌ Upload failed.\n\n⚠️ Reason:\n`{result}`")
             
         if os.path.exists(file_path):
             os.remove(file_path)
             
     except Exception as e:
-        logger.error(f"Telegram file error: {e}")
-        await msg.edit_text(f"❌ An error occurred during download:\n`{str(e)}`")
+        error_details = traceback.format_exc()
+        logger.error(f"Telegram file error: {error_details}")
+        await msg.edit_text(f"❌ Download Error:\n`{str(e)}`")
 
 @app.on_message(filters.regex(r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+"))
 async def handle_links(client, message):
@@ -194,7 +257,23 @@ async def handle_links(client, message):
         return
 
     url = message.text
+    
+    # 1. Handle Google Drive Links directly (Clone feature)
+    if "drive.google.com" in url:
+        g_id = extract_gdrive_id(url)
+        if g_id:
+            msg = await message.reply_text("🔄 Google Drive link detected!\nCloning directly to your Drive...")
+            success, result = await clone_gdrive_file(g_id)
+            if success:
+                file_name = result.get('name', 'Unknown Name')
+                await msg.edit_text(f"✅ GDrive Clone Complete (Instant)!\n\n📄 File: `{file_name}`")
+            else:
+                await msg.edit_text(f"❌ GDrive Clone Failed.\n*Note: The file must be 'Anyone with the link can view'.*\n\n⚠️ Reason:\n`{result}`")
+            return
+
+    # 2. Handle Normal Direct Links
     msg = await message.reply_text("🔗 Link received! Starting download...")
+    file_path = None
     
     try:
         file_name = url.split("/")[-1]
@@ -220,16 +299,21 @@ async def handle_links(client, message):
         success, result = await upload_to_drive_async(file_path, file_name, msg)
         
         if success:
-            await msg.edit_text(f"✅ Link Upload Complete!\n\nFile Name: {file_name}")
+            await msg.edit_text(f"✅ Link Upload Complete!\n\n📄 File: `{file_name}`")
         else:
-            await msg.edit_text(f"❌ Upload failed.\n\n⚠️ Error Reason:\n`{result}`")
+            await msg.edit_text(f"❌ Upload failed.\n\n⚠️ Reason:\n`{result}`")
             
-        if os.path.exists(file_path):
-            os.remove(file_path)
-            
+    except OSError as e: # Catch "Disk Full" errors specifically
+        logger.error(f"Storage Error: {e}")
+        await msg.edit_text(f"❌ Server Storage Full!\nThe free server doesn't have enough space for this large file.\n\n⚠️ Detailed Reason:\n`{str(e)}`")
     except Exception as e:
-        logger.error(f"Link download error: {e}")
+        error_details = traceback.format_exc()
+        logger.error(f"Link download error: {error_details}")
         await msg.edit_text(f"❌ Error handling link:\n`{str(e)}`")
+    finally:
+        # Always cleanup to prevent disk full issues
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
 
 # ================= WEB SERVER =================
 async def start_web_server():
