@@ -10,6 +10,7 @@ import functools
 import zipfile
 import shutil
 import urllib.parse
+import io
 
 try:
     asyncio.get_event_loop()
@@ -19,12 +20,12 @@ except RuntimeError:
 import aiohttp
 from aiohttp import web
 from pyrogram import Client, filters, idle
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, InputMediaPhoto
 from pyrogram.errors import MessageNotModified
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
 # Try importing Video Processing Libraries
 try:
@@ -34,7 +35,7 @@ try:
 except ImportError:
     HAS_CV2 = False
 
-# ================= LOGGING SETUP (Memory Included) =================
+# ================= LOGGING SETUP =================
 class MemoryLogHandler(logging.Handler):
     def __init__(self, capacity=20):
         super().__init__()
@@ -48,12 +49,10 @@ class MemoryLogHandler(logging.Handler):
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# Console Output
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 logger.addHandler(console_handler)
 
-# Memory Output for /logs command
 memory_handler = MemoryLogHandler(capacity=20)
 memory_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
 logger.addHandler(memory_handler)
@@ -85,11 +84,11 @@ oauth_flow = None
 # ================= CACHE & STATES =================
 LINK_CACHE = {}  
 USER_STATES = {} 
-MYFILES_CACHE = {} # For Pagination
-PREVIEW_CACHE = {} # For Video Previews
+MYFILES_CACHE = {} 
+PREVIEW_CACHE = {} 
 BOT_STATS = {"uploads": 0, "clones": 0, "bytes_uploaded": 0}
+ACTIVE_TASKS = {} # Stores cancel status
 
-# Create Previews Folder
 os.makedirs("previews", exist_ok=True)
 
 # ================= TELEGRAM BOT =================
@@ -113,7 +112,8 @@ def get_drive_service():
 
 def format_size(bytes_size):
     if bytes_size >= 1024 ** 3: return f"{bytes_size / (1024 ** 3):.2f} GB"
-    return f"{bytes_size / (1024 ** 2):.2f} MB"
+    if bytes_size >= 1024 ** 2: return f"{bytes_size / (1024 ** 2):.2f} MB"
+    return f"{bytes_size / 1024:.2f} KB"
 
 def format_time(seconds):
     seconds = int(seconds)
@@ -129,37 +129,50 @@ def get_safe_error(e):
         err_str = err_str.replace(char, '')
     return err_str[:800]
 
-def generate_video_preview(video_path, output_path):
-    if not HAS_CV2: return False
+async def fetch_url_metadata(url):
+    """Fetches real filename and size directly from the server headers."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, allow_redirects=True, timeout=5) as resp:
+                size = int(resp.headers.get('Content-Length', 0))
+                cd = resp.headers.get('Content-Disposition', '')
+                name = None
+                if 'filename=' in cd:
+                    matches = re.findall(r'filename\*?=(?:UTF-8\'\')?([^;]+)', cd)
+                    if matches:
+                        name = urllib.parse.unquote(matches[0].strip('"\''))
+                if not name:
+                    name = urllib.parse.unquote(url.split('/')[-1].split('?')[0])
+                if not name:
+                    name = f"file_{int(time.time())}"
+                return name, size
+    except Exception:
+        return url.split('/')[-1].split('?')[0], 0
+
+def generate_video_preview(video_path, output_dir, prefix):
+    """Extracts 10 frames and returns a list of file paths."""
+    if not HAS_CV2: return []
     try:
         cap = cv2.VideoCapture(video_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        if total_frames <= 0 or fps <= 0: return False
-
-        frames = []
+        if total_frames <= 0: return []
+        paths = []
         for i in range(10):
             frame_id = int(total_frames * (0.05 + 0.09 * i))
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
             ret, frame = cap.read()
             if ret:
-                frame = cv2.resize(frame, (320, 180))
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frames.append(Image.fromarray(frame))
+                img = Image.fromarray(frame)
+                p = os.path.join(output_dir, f"{prefix}_{i}.jpg")
+                img.save(p, format="JPEG", quality=85)
+                paths.append(p)
         cap.release()
-        if not frames: return False
-
-        w, h = 320, 180
-        collage = Image.new('RGB', (w * 2, h * 5))
-        for i, img in enumerate(frames):
-            collage.paste(img, ((i % 2) * w, (i // 2) * h))
-        collage.save(output_path, format="JPEG", quality=85)
-        return True
+        return paths
     except Exception as e:
         logger.error(f"Preview gen error: {e}")
-        return False
+        return []
 
-# BUG FIXED: Added `, False` for file ID returns!
 def extract_gdrive_id(url):
     match = re.search(r"/d/([a-zA-Z0-9_-]+)", url)
     if match: return match.group(1), False
@@ -175,10 +188,8 @@ def check_auth(user_id):
 
 def generate_result_text(file_name, file_id, file_size, elapsed_time, is_folder=False):
     drive_link = f"https://drive.google.com/drive/folders/{file_id}" if is_folder else f"https://drive.google.com/file/d/{file_id}/view"
-    
     safe_name = urllib.parse.quote(file_name)
     if CF_WORKER_URL:
-        # GoIndex Format with 0:down
         direct_link = f"{CF_WORKER_URL}/0:down/{safe_name}"
         if is_folder: direct_link += "/"
     else:
@@ -195,6 +206,9 @@ def generate_result_text(file_name, file_id, file_size, elapsed_time, is_folder=
     return text
 
 async def update_progress(current, total, msg, start_time, action_text):
+    if ACTIVE_TASKS.get(msg.id, {}).get('cancel'):
+        raise Exception("TaskCancelled")
+        
     if total == 0: return
     now = time.time()
     if not hasattr(msg, "last_update_time"): msg.last_update_time = start_time
@@ -218,7 +232,8 @@ async def update_progress(current, total, msg, start_time, action_text):
         )
         if text != msg.last_text:
             try:
-                await msg.edit_text(text)
+                btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_task|{msg.id}")]])
+                await msg.edit_text(text, reply_markup=btn)
                 msg.last_text = text
             except MessageNotModified:
                 pass
@@ -238,6 +253,8 @@ async def upload_to_drive_async(file_path, file_name, msg, parent_id=DRIVE_FOLDE
         start_time = time.time()
         
         while response is None:
+            if ACTIVE_TASKS.get(msg.id, {}).get('cancel'):
+                raise Exception("TaskCancelled")
             status, response = await asyncio.to_thread(functools.partial(request.next_chunk, num_retries=5))
             if status:
                 await update_progress(status.resumable_progress, file_size, msg, start_time, "☁️ Uploading to Google Drive...")
@@ -249,6 +266,30 @@ async def upload_to_drive_async(file_path, file_name, msg, parent_id=DRIVE_FOLDE
     except Exception as e:
         return False, get_safe_error(e), 0, 0
 
+async def download_from_gdrive(file_id, file_path, msg):
+    """Downloads a file from GDrive to local server (for extraction)."""
+    success, service = get_drive_service()
+    if not success: raise Exception("Auth Error")
+    
+    file_info = service.files().get(fileId=file_id, fields="size").execute()
+    total_size = int(file_info.get('size', 0))
+    
+    request = service.files().get_media(fileId=file_id)
+    fh = io.FileIO(file_path, 'wb')
+    downloader = MediaIoBaseDownload(fh, request, chunksize=20*1024*1024)
+    done = False
+    start_time = time.time()
+    
+    while done is False:
+        if ACTIVE_TASKS.get(msg.id, {}).get('cancel'):
+            fh.close()
+            raise Exception("TaskCancelled")
+        status, done = await asyncio.to_thread(downloader.next_chunk)
+        if status:
+            await update_progress(int(status.progress() * total_size), total_size, msg, start_time, "📥 Downloading from GDrive for Extraction...")
+    fh.close()
+    return True
+
 def create_gdrive_folder(folder_name, parent_id=DRIVE_FOLDER_ID):
     success, service = get_drive_service()
     if not success: return None
@@ -256,13 +297,14 @@ def create_gdrive_folder(folder_name, parent_id=DRIVE_FOLDER_ID):
     folder = service.files().create(body=metadata, fields='id').execute()
     return folder.get('id')
 
-async def clone_gdrive_item(item_id, is_folder=False, parent_id=DRIVE_FOLDER_ID):
+async def clone_gdrive_item(item_id, is_folder=False, parent_id=DRIVE_FOLDER_ID, new_name=None):
     try:
         success, service = get_drive_service()
         if not success: return False, service
         
         if not is_folder:
             body = {'parents': [parent_id]}
+            if new_name: body['name'] = new_name
             response = await asyncio.to_thread(
                 lambda: service.files().copy(fileId=item_id, body=body, fields='id, name').execute()
             )
@@ -270,7 +312,8 @@ async def clone_gdrive_item(item_id, is_folder=False, parent_id=DRIVE_FOLDER_ID)
             return True, response
         else:
             original_folder = service.files().get(fileId=item_id, fields='name').execute()
-            new_folder_id = create_gdrive_folder(original_folder.get('name'), parent_id)
+            folder_name = new_name if new_name else original_folder.get('name')
+            new_folder_id = create_gdrive_folder(folder_name, parent_id)
             
             query = f"'{item_id}' in parents and trashed=false"
             results = service.files().list(q=query, fields="nextPageToken, files(id, name, mimeType)", pageSize=1000).execute()
@@ -283,7 +326,7 @@ async def clone_gdrive_item(item_id, is_folder=False, parent_id=DRIVE_FOLDER_ID)
                     await clone_gdrive_item(item['id'], is_folder=False, parent_id=new_folder_id)
                     
             BOT_STATS["clones"] += 1
-            return True, {"name": original_folder.get('name'), "id": new_folder_id}
+            return True, {"name": folder_name, "id": new_folder_id}
     except Exception as e:
         return False, get_safe_error(e)
 
@@ -315,7 +358,7 @@ async def stats_command(client, message):
 async def logs_command(client, message):
     if not check_auth(message.from_user.id): return
     logs_txt = "\n".join(memory_handler.logs) if memory_handler.logs else "No recent logs."
-    await message.reply_text(f"📜 **Recent Logs:**\n`{logs_txt[-3000:]}`") # Send last 3k chars
+    await message.reply_text(f"📜 **Recent Logs:**\n`{logs_txt[-3000:]}`")
 
 @app.on_message(filters.command("storage"))
 async def storage_command(client, message):
@@ -349,7 +392,6 @@ async def search_command(client, message):
     
     msg = await message.reply_text("🔍 Searching...")
     try:
-        # Fuzzy search simulation with "OR" conditions for each word
         words = keyword.split()
         search_terms = " or ".join([f"name contains '{w}'" for w in words])
         q = f"trashed=false and ({search_terms})"
@@ -360,7 +402,6 @@ async def search_command(client, message):
         if not items:
             return await msg.edit_text("❌ No similar files found.")
             
-        # Put items in MYFILES_CACHE to reuse pagination UI
         MYFILES_CACHE[message.from_user.id] = {
             "items": items, "page": 0, "parent": "search_results", "stack": []
         }
@@ -368,7 +409,7 @@ async def search_command(client, message):
     except Exception as e:
         await msg.edit_text(f"Search failed: {get_safe_error(e)}")
 
-# ================= ADVANCED MYFILES (Pagination) =================
+# ================= ADVANCED MYFILES =================
 @app.on_message(filters.command("myfiles"))
 async def myfiles_command(client, message):
     if not check_auth(message.from_user.id): return
@@ -377,20 +418,16 @@ async def myfiles_command(client, message):
 async def fetch_and_render_folder(message_obj_or_query, user_id, folder_id, init=False):
     success, service = get_drive_service()
     if not success: return
-    
     msg = await message_obj_or_query.reply_text("Fetching files...") if init else message_obj_or_query.message
-    
     try:
         query = f"'{folder_id}' in parents and trashed=false"
         results = service.files().list(q=query, orderBy="folder, modifiedTime desc", fields="files(id, name, mimeType, size)", pageSize=100).execute()
         items = results.get('files', [])
-        
         if init:
             MYFILES_CACHE[user_id] = {"items": items, "page": 0, "parent": folder_id, "stack": []}
         else:
             stack = MYFILES_CACHE[user_id]["stack"]
             MYFILES_CACHE[user_id] = {"items": items, "page": 0, "parent": folder_id, "stack": stack}
-            
         await render_myfiles_page(msg, user_id)
     except Exception as e:
         await (msg.edit_text if not init else msg.reply_text)(f"Fetch failed: {get_safe_error(e)}")
@@ -398,11 +435,10 @@ async def fetch_and_render_folder(message_obj_or_query, user_id, folder_id, init
 async def render_myfiles_page(msg, user_id):
     cache = MYFILES_CACHE.get(user_id)
     if not cache: return await msg.edit_text("Session expired. Type /myfiles again.")
-    
     items = cache["items"]
     page = cache["page"]
     per_page = 3
-    total_pages = (len(items) + per_page - 1) // per_page
+    total_pages = max(1, (len(items) + per_page - 1) // per_page)
     
     if not items:
         text = "📂 **Folder is empty!**"
@@ -422,16 +458,13 @@ async def render_myfiles_page(msg, user_id):
         icon = "📁" if is_folder else "📄"
         idx_in_cache = start_idx + i
         text += f"{i+1}. {icon} `{item['name']}`\n"
-        
         btn_text = f"📂 Open #{i+1}" if is_folder else f"⚙️ Options #{i+1}"
         buttons.append([InlineKeyboardButton(btn_text, callback_data=f"mf_act|{idx_in_cache}")])
 
-    # Navigation Row
     nav_row = []
     if page > 0: nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data="mf_nav|prev"))
     if page < total_pages - 1: nav_row.append(InlineKeyboardButton("Next ➡️", callback_data="mf_nav|next"))
     if nav_row: buttons.append(nav_row)
-    
     if cache["stack"]: buttons.append([InlineKeyboardButton("🔼 Back to Parent", callback_data="mf_back")])
     
     await msg.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
@@ -441,18 +474,17 @@ async def render_myfiles_page(msg, user_id):
 async def start_command(client, message):
     if not check_auth(message.from_user.id): return
     if not GOOGLE_OAUTH_TOKEN:
-        await message.reply_text(f"⚠️ Connect Google Drive first:\n{RENDER_URL}/login")
-        return
+        return await message.reply_text(f"⚠️ Connect Google Drive first:\n{RENDER_URL}/login")
     await message.reply_text(
         "Hello! 👋\n"
         "Send me a link or file. I support:\n"
         "- Direct Download Links (With Rename/Extract features)\n"
-        "- Google Drive File/Folder Links (Instant Clone)\n"
+        "- Google Drive File/Folder Links (With Options)\n"
         "- Telegram Files\n\n"
         "**Useful Commands:**\n"
         "`/myfiles` - Advanced Drive Manager\n"
         "`/search <name>` - Search files\n"
-        "`/stats` - Session Upload Stats\n"
+        "`/stats` - Session Stats\n"
         "`/storage` - Check Drive space"
     )
 
@@ -470,6 +502,21 @@ async def handle_text_input(client, message):
         await process_download(client, message, url, new_name, extract=False)
         return
         
+    if state and state.get("action") == "wait_rename_clone":
+        new_name = message.text.strip()
+        g_id = state.get("gdrive_id")
+        f_size = state.get("size", 0)
+        del USER_STATES[user_id]
+        
+        msg = await message.reply_text(f"🔄 Cloning as `{new_name}`...")
+        success, result = await clone_gdrive_item(g_id, is_folder=False, new_name=new_name)
+        if success:
+            file_id = result.get('id')
+            await msg.edit_text(generate_result_text(new_name, file_id, f_size, 0))
+        else:
+            await msg.edit_text(f"❌ Clone Failed.\nReason:\n{result}")
+        return
+
     if state and state.get("action") == "wait_drive_rename":
         new_name = message.text.strip()
         file_id = state.get("file_id")
@@ -486,23 +533,45 @@ async def handle_text_input(client, message):
     url = message.text
     if not re.match(r"http[s]?://", url): return
 
+    # --- GDRIVE LINK HANDLING ---
     if "drive.google.com" in url:
         g_id, is_folder = extract_gdrive_id(url)
         if g_id:
-            msg = await message.reply_text(f"🔄 Cloning {'Folder' if is_folder else 'File'} to Drive...")
-            success, result = await clone_gdrive_item(g_id, is_folder)
-            if success:
-                name = result.get('name') if is_folder else result.get('name', 'File')
-                await msg.edit_text(f"✅ GDrive Clone Complete!\n\nName: `{name}`")
+            if is_folder:
+                msg = await message.reply_text(f"🔄 Cloning Folder to Drive...")
+                success, result = await clone_gdrive_item(g_id, is_folder=True)
+                if success:
+                    await msg.edit_text(f"✅ GDrive Folder Clone Complete!\n\nFolder: `{result.get('name')}`")
+                else:
+                    await msg.edit_text(f"❌ GDrive Clone Failed.\n\nReason:\n{result}")
             else:
-                await msg.edit_text(f"❌ GDrive Clone Failed.\n\nReason:\n{result}")
+                try:
+                    success, service = get_drive_service()
+                    file_info = service.files().get(fileId=g_id, fields="id, name, size").execute()
+                    file_name = file_info.get('name', 'Unknown')
+                    file_size = int(file_info.get('size', 0))
+                    LINK_CACHE[message.id] = {"url": url, "name": file_name, "gdrive_id": g_id, "size": file_size}
+                    
+                    buttons = [
+                        [InlineKeyboardButton("🔄 Clone Now", callback_data=f"dl_clone|{message.id}"),
+                         InlineKeyboardButton("✏️ Rename & Clone", callback_data=f"dl_ren_clone|{message.id}")]
+                    ]
+                    if file_name.lower().endswith('.zip'):
+                        buttons.append([InlineKeyboardButton("📦 Extract to Drive", callback_data=f"dl_ext|{message.id}")])
+                        
+                    await message.reply_text(
+                        f"🔗 **GDrive File Detected!**\n📄 Name: `{file_name}`\n📦 Size: `{format_size(file_size)}`\n\nChoose an action:",
+                        reply_markup=InlineKeyboardMarkup(buttons)
+                    )
+                except Exception as e:
+                    await message.reply_text(f"❌ Could not fetch GDrive info. Error:\n{get_safe_error(e)}")
             return
 
-    file_name = url.split("/")[-1].split("?")[0]
-    if not file_name: file_name = f"download_{int(time.time())}"
+    # --- NORMAL URL HANDLING ---
+    wait_msg = await message.reply_text("⏳ Fetching file details...")
+    file_name, file_size = await fetch_url_metadata(url)
     
-    LINK_CACHE[message.id] = {"url": url, "name": file_name}
-    
+    LINK_CACHE[message.id] = {"url": url, "name": file_name, "size": file_size}
     buttons = [
         [InlineKeyboardButton("⬇️ Download Now", callback_data=f"dl_now|{message.id}"),
          InlineKeyboardButton("✏️ Rename", callback_data=f"dl_ren|{message.id}")]
@@ -510,8 +579,8 @@ async def handle_text_input(client, message):
     if file_name.lower().endswith('.zip'):
         buttons.append([InlineKeyboardButton("📦 Extract & Upload", callback_data=f"dl_ext|{message.id}")])
         
-    await message.reply_text(
-        f"🔗 **Link Detected!**\nFile: `{file_name}`\n\nChoose an action below:",
+    await wait_msg.edit_text(
+        f"🔗 **Link Detected!**\n📄 Name: `{file_name}`\n📦 Size: `{format_size(file_size) if file_size > 0 else 'Unknown'}`\n\nChoose an action:",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
@@ -522,8 +591,15 @@ async def callback_handler(client, query: CallbackQuery):
     data = query.data.split("|")
     action = data[0]
 
-    # ---- DOWNLOAD/EXTRACT LINKS ----
-    if action in ["dl_now", "dl_ren", "dl_ext"]:
+    if action == "cancel_task":
+        task_id = int(data[1])
+        if task_id in ACTIVE_TASKS:
+            ACTIVE_TASKS[task_id]['cancel'] = True
+            await query.answer("Cancelling task...", show_alert=True)
+        else:
+            await query.answer("Task not found or already finished.", show_alert=True)
+
+    elif action in ["dl_now", "dl_ren", "dl_ext", "dl_clone", "dl_ren_clone"]:
         msg_id = int(data[1])
         link_data = LINK_CACHE.get(msg_id)
         if not link_data:
@@ -531,25 +607,45 @@ async def callback_handler(client, query: CallbackQuery):
             
         url = link_data["url"]
         default_name = link_data["name"]
+        gdrive_id = link_data.get("gdrive_id")
         await query.message.delete()
         
-        if action == "dl_now": await process_download(client, query.message, url, default_name, extract=False)
-        elif action == "dl_ext": await process_download(client, query.message, url, default_name, extract=True)
+        if action == "dl_clone":
+            msg = await app.send_message(user_id, "🔄 Cloning File to Drive...")
+            success, result = await clone_gdrive_item(gdrive_id, is_folder=False, new_name=default_name)
+            if success:
+                file_id = result.get('id')
+                await msg.edit_text(generate_result_text(default_name, file_id, link_data.get("size", 0), 0))
+            else:
+                await msg.edit_text(f"❌ Clone Failed.\nReason:\n{result}")
+                
+        elif action == "dl_ren_clone":
+            USER_STATES[user_id] = {"action": "wait_rename_clone", "gdrive_id": gdrive_id, "size": link_data.get("size", 0)}
+            await app.send_message(user_id, "Please send the **new name** for the file (including extension):")
+
+        elif action == "dl_now": 
+            await process_download(client, query.message, url, default_name, extract=False, gdrive_id=gdrive_id)
+        elif action == "dl_ext": 
+            await process_download(client, query.message, url, default_name, extract=True, gdrive_id=gdrive_id)
         elif action == "dl_ren":
             USER_STATES[user_id] = {"action": "wait_rename", "url": url}
-            await app.send_message(user_id, "Please send the **new name** for the file (including extension like .mp4, .mkv):")
+            await app.send_message(user_id, "Please send the **new name** for the file (including extension like .mp4, .zip):")
 
-    # ---- VIDEO PREVIEW ----
     elif action == "pv":
         preview_id = data[1]
-        img_path = PREVIEW_CACHE.get(preview_id)
-        if img_path and os.path.exists(img_path):
-            await query.answer("Uploading Preview...")
-            await query.message.reply_photo(photo=img_path, caption="🎬 **Video Clips Preview**")
+        paths = PREVIEW_CACHE.get(preview_id, [])
+        if paths:
+            await query.answer("Uploading Preview Clips...")
+            media_group = [InputMediaPhoto(p) for p in paths if os.path.exists(p)]
+            if media_group:
+                await app.send_media_group(query.message.chat.id, media_group)
+            # Cleanup storage after sending!
+            for p in paths:
+                if os.path.exists(p): os.remove(p)
+            del PREVIEW_CACHE[preview_id]
         else:
-            await query.answer("Preview image not found or expired.", show_alert=True)
+            await query.answer("Preview expired or not found.", show_alert=True)
 
-    # ---- MYFILES NAVIGATION ----
     elif action == "mf_nav":
         cache = MYFILES_CACHE.get(user_id)
         if not cache: return await query.answer("Session expired.", show_alert=True)
@@ -585,7 +681,6 @@ async def callback_handler(client, query: CallbackQuery):
     elif action == "mf_ret":
         await render_myfiles_page(query.message, user_id)
 
-    # ---- DRIVE FILE MANAGEMENT ----
     elif action == "del_file":
         file_id = data[1]
         success, service = get_drive_service()
@@ -603,34 +698,40 @@ async def callback_handler(client, query: CallbackQuery):
         await query.answer("Check your messages to rename.", show_alert=False)
         await app.send_message(user_id, "Please send the **new name** for this Google Drive file:")
 
-async def process_download(client, message, url, file_name, extract=False):
-    msg = await app.send_message(message.chat.id, "📥 Starting download...")
+async def process_download(client, message, url, file_name, extract=False, gdrive_id=None):
+    msg = await app.send_message(message.chat.id, "📥 Starting process...")
     file_path = os.path.join(os.getcwd(), file_name)
     start_time = time.time()
+    ACTIVE_TASKS[msg.id] = {'cancel': False}
     
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                response.raise_for_status()
-                total_size = int(response.headers.get('content-length', 0))
-                downloaded = 0
-                with open(file_path, 'wb') as f:
-                    async for chunk in response.content.iter_chunked(2 * 1024 * 1024):
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if total_size > 0:
-                            await update_progress(downloaded, total_size, msg, start_time, "📥 Downloading to server...")
-                            
-        # Video Preview Handling
+        if gdrive_id:
+            await download_from_gdrive(gdrive_id, file_path, msg)
+        else:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as response:
+                    response.raise_for_status()
+                    total_size = int(response.headers.get('content-length', 0))
+                    downloaded = 0
+                    with open(file_path, 'wb') as f:
+                        async for chunk in response.content.iter_chunked(2 * 1024 * 1024):
+                            if ACTIVE_TASKS.get(msg.id, {}).get('cancel'):
+                                raise Exception("TaskCancelled")
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if total_size > 0:
+                                await update_progress(downloaded, total_size, msg, start_time, "📥 Downloading to server...")
+                                
         preview_id = None
         if file_name.lower().endswith(('.mp4', '.mkv', '.avi', '.webm')):
-            await msg.edit_text("🎬 Extracting Video Preview...")
-            pv_path = f"./previews/{int(time.time())}.jpg"
-            if generate_video_preview(file_path, pv_path):
-                preview_id = str(int(time.time()))
-                PREVIEW_CACHE[preview_id] = pv_path
+            await msg.edit_text("🎬 Extracting Video Clips...")
+            preview_id = str(int(time.time()))
+            paths = generate_video_preview(file_path, "./previews", preview_id)
+            if paths:
+                PREVIEW_CACHE[preview_id] = paths
+            else:
+                preview_id = None
 
-        # Extraction Handling
         if extract and file_name.lower().endswith('.zip'):
             await msg.edit_text("📦 Extracting ZIP file...")
             extract_dir = os.path.join(os.getcwd(), file_name + "_extracted")
@@ -649,6 +750,7 @@ async def process_download(client, message, url, file_name, extract=False):
             total_files_uploaded = 0
             for root, dirs, files in os.walk(extract_dir):
                 for fname in files:
+                    if ACTIVE_TASKS.get(msg.id, {}).get('cancel'): raise Exception("TaskCancelled")
                     fpath = os.path.join(root, fname)
                     await msg.edit_text(f"☁️ Uploading extracted file: `{fname}`...")
                     up_success, _, _, _ = await upload_to_drive_async(fpath, fname, msg, parent_id=new_folder_id)
@@ -662,18 +764,14 @@ async def process_download(client, message, url, file_name, extract=False):
             shutil.rmtree(extract_dir, ignore_errors=True)
             return
 
-        # Normal Upload
         success, file_id, file_size, upload_time = await upload_to_drive_async(file_path, file_name, msg)
         
         if success:
             total_elapsed = time.time() - start_time
             text = generate_result_text(file_name, file_id, file_size, total_elapsed)
-            
-            # Attach preview button if available
             reply_markup = None
             if preview_id:
-                reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🎬 View Preview", callback_data=f"pv|{preview_id}")]])
-                
+                reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🎬 View Previews (10 Clips)", callback_data=f"pv|{preview_id}")]])
             await msg.edit_text(text, reply_markup=reply_markup)
         else:
             await msg.edit_text(f"❌ Upload failed.\n\n⚠️ Reason:\n{file_id}")
@@ -681,8 +779,12 @@ async def process_download(client, message, url, file_name, extract=False):
     except OSError as e: 
         await msg.edit_text(f"❌ Server Storage Full!\n⚠️ Reason:\n{get_safe_error(e)}")
     except Exception as e:
-        await msg.edit_text(f"❌ Error:\n{get_safe_error(e)}")
+        if str(e) == "TaskCancelled":
+            await msg.edit_text("🚫 **Task Cancelled by User.**")
+        else:
+            await msg.edit_text(f"❌ Error:\n{get_safe_error(e)}")
     finally:
+        ACTIVE_TASKS.pop(msg.id, None)
         if file_path and os.path.exists(file_path):
             os.remove(file_path)
 
@@ -693,18 +795,23 @@ async def handle_telegram_files(client, message):
     
     msg = await message.reply_text("📥 Preparing Telegram download...")
     start_time = time.time()
+    ACTIVE_TASKS[msg.id] = {'cancel': False}
+    file_path = None
     
     try:
         file_path = await message.download(progress=update_progress, progress_args=(msg, start_time, "📥 Downloading from Telegram..."))
+        if not file_path: raise Exception("Download failed.")
         file_name = os.path.basename(file_path)
         
         preview_id = None
         if file_name.lower().endswith(('.mp4', '.mkv', '.avi', '.webm')):
-            await msg.edit_text("🎬 Extracting Video Preview...")
-            pv_path = f"./previews/{int(time.time())}.jpg"
-            if generate_video_preview(file_path, pv_path):
-                preview_id = str(int(time.time()))
-                PREVIEW_CACHE[preview_id] = pv_path
+            await msg.edit_text("🎬 Extracting Video Clips...")
+            preview_id = str(int(time.time()))
+            paths = generate_video_preview(file_path, "./previews", preview_id)
+            if paths:
+                PREVIEW_CACHE[preview_id] = paths
+            else:
+                preview_id = None
 
         success, file_id, file_size, up_time = await upload_to_drive_async(file_path, file_name, msg)
         
@@ -713,12 +820,18 @@ async def handle_telegram_files(client, message):
             text = generate_result_text(file_name, file_id, file_size, total_elapsed)
             reply_markup = None
             if preview_id:
-                reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🎬 View Preview", callback_data=f"pv|{preview_id}")]])
+                reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🎬 View Previews (10 Clips)", callback_data=f"pv|{preview_id}")]])
             await msg.edit_text(text, reply_markup=reply_markup)
         else:
             await msg.edit_text(f"❌ Upload failed.\nReason: {file_id}")
+    except Exception as e:
+        if str(e) == "TaskCancelled":
+            await msg.edit_text("🚫 **Task Cancelled by User.**")
+        else:
+            await msg.edit_text(f"❌ Error:\n{get_safe_error(e)}")
     finally:
-        if 'file_path' in locals() and file_path and os.path.exists(file_path):
+        ACTIVE_TASKS.pop(msg.id, None)
+        if file_path and os.path.exists(file_path):
             os.remove(file_path)
 
 # ================= WEB SERVER =================
