@@ -28,7 +28,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from googleapiclient.errors import HttpError
 
-# ভিডিও প্রসেসিং লাইব্রেরি চেক করা হচ্ছে
+# Video processing check
 try:
     import cv2
     from PIL import Image
@@ -36,7 +36,7 @@ try:
 except ImportError:
     HAS_CV2 = False
 
-# ================= লগিং সেটআপ (মেমোরি সহ) =================
+# ================= LOGGING SETUP =================
 class MemoryLogHandler(logging.Handler):
     def __init__(self, capacity=20):
         super().__init__()
@@ -55,7 +55,7 @@ memory_handler = MemoryLogHandler(capacity=20)
 memory_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
 logger.addHandler(memory_handler)
 
-# ================= এনভায়রনমেন্ট ভেরিয়েবল =================
+# ================= ENVIRONMENT VARIABLES =================
 API_ID_STR = os.environ.get("API_ID", "").strip()
 API_HASH = os.environ.get("API_HASH", "").strip()
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
@@ -79,6 +79,7 @@ USER_STATES = {}
 MYFILES_CACHE = {}
 PREVIEW_CACHE = {} 
 CANCEL_FLAGS = {}
+PROGRESS_CACHE = {} # BUG FIX: Added separate cache for progress timing
 BOT_STATS = {"uploads": 0, "clones": 0, "bytes_uploaded": 0}
 
 os.makedirs("previews", exist_ok=True)
@@ -109,7 +110,7 @@ def get_safe_error(e): return str(e).replace('<', '').replace('>', '')[:800]
 def get_cancel_markup(cancel_id):
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{cancel_id}")]])
 
-# --- স্মার্ট ইউআরএল মেটাডেটা ফেচার (আসল নাম ডিটেকশন) ---
+# --- URL Metadata Fetcher ---
 async def get_url_metadata(url):
     try:
         connector = aiohttp.TCPConnector(limit=10)
@@ -128,7 +129,7 @@ async def get_url_metadata(url):
     except:
         return f"download_{int(time.time())}", 0
 
-# --- ১০ ফ্রেমের ভিডিও প্রিভিউ জেনারেটর ---
+# --- Video Preview Gen ---
 def generate_10_video_frames(video_path, preview_id):
     if not HAS_CV2: return []
     try:
@@ -169,16 +170,17 @@ def generate_result_text(file_name, file_id, file_size, elapsed_time, is_folder=
     return (f"✅ **Task Completed!**\n\n📄 **Name:** `{file_name}`\n📦 **Size:** `{format_size(file_size)}`\n⏱️ **Time:** `{format_time(elapsed_time)}`\n\n"
             f"🔗 [Google Drive Link]({drive_link})\n⚡ [Direct Download Link]({direct_link})")
 
-# লাইভ প্রোগ্রেস আপডেট
+# --- BUG FIX: STABLE PROGRESS BAR ---
 async def update_progress(current, total, msg, start_time, action_text, cancel_id=None):
     if cancel_id and CANCEL_FLAGS.get(cancel_id): raise Exception("CANCELLED")
-    if total == 0: return
-    now = time.time()
-    if not hasattr(msg, "last_update_time"): msg.last_update_time = start_time
+    if total == 0: total = current + 1 # Prevent division by zero
     
-    if (now - msg.last_update_time > 2.5) or (current == total):
-        msg.last_update_time = now
-        percent = (current / total) * 100
+    now = time.time()
+    last_update_time = PROGRESS_CACHE.get(cancel_id, start_time) if cancel_id else start_time
+    
+    if (now - last_update_time > 2.5) or (current == total):
+        if cancel_id: PROGRESS_CACHE[cancel_id] = now
+        percent = min(100.0, (current / total) * 100)
         filled = int(percent / 10)
         bar = "🟩" * filled + "🟥" * (10 - filled)
         elapsed = now - start_time
@@ -189,7 +191,7 @@ async def update_progress(current, total, msg, start_time, action_text, cancel_i
         try: await msg.edit_text(text, reply_markup=get_cancel_markup(cancel_id) if cancel_id else None)
         except MessageNotModified: pass
 
-# --- স্পিড অপ্টিমাইজড মাল্টি-কানেকশন (প্যারালাল) ডাউনলোড লজিক ---
+# --- Parallel Download ---
 async def download_part(session, url, start, end, part_path, progress, msg, start_time, cancel_id):
     headers = {'Range': f'bytes={start}-{end}'}
     async with session.get(url, headers=headers) as resp:
@@ -201,13 +203,13 @@ async def download_part(session, url, start, end, part_path, progress, msg, star
                 progress['downloaded'] += len(chunk)
                 await update_progress(progress['downloaded'], progress['total'], msg, start_time, "⚡ Parallel Downloading...", cancel_id)
 
-# --- গুগল ড্রাইভ স্পিড আপলোড ---
+# --- Drive Upload ---
 async def upload_to_drive_async(file_path, file_name, msg, parent_id=DRIVE_FOLDER_ID, cancel_id=None):
     try:
         success, service = get_drive_service()
         if not success: return False, service, 0, 0
         file_size = os.path.getsize(file_path)
-        media = MediaFileUpload(file_path, chunksize=50*1024*1024, resumable=True) # 50MB আপলোড চাঙ্ক
+        media = MediaFileUpload(file_path, chunksize=50*1024*1024, resumable=True) 
         request = service.files().create(body={'name': file_name, 'parents': [parent_id]}, media_body=media, fields='id')
         
         response, start_time = None, time.time()
@@ -215,7 +217,6 @@ async def upload_to_drive_async(file_path, file_name, msg, parent_id=DRIVE_FOLDE
             if cancel_id and CANCEL_FLAGS.get(cancel_id): raise Exception("CANCELLED")
             status, response = await asyncio.to_thread(functools.partial(request.next_chunk, num_retries=5))
             if status: 
-                # BUG FIX: status.resumable_progress is a property, not a function!
                 await update_progress(status.resumable_progress, file_size, msg, start_time, "☁️ Uploading to Drive...", cancel_id)
                 
         BOT_STATS["uploads"] += 1
@@ -223,7 +224,7 @@ async def upload_to_drive_async(file_path, file_name, msg, parent_id=DRIVE_FOLDE
         return True, response.get('id'), file_size, time.time() - start_time
     except Exception as e: return False, get_safe_error(e), 0, 0
 
-# --- গুগল ড্রাইভ আইটেম (ফোল্ডার সহ) ক্লোন লজিক ---
+# --- Clone Drive Item ---
 async def clone_gdrive_item(item_id, is_folder=False, parent_id=DRIVE_FOLDER_ID, msg=None):
     try:
         success, service = get_drive_service()
@@ -262,7 +263,7 @@ def create_gdrive_folder(folder_name, parent_id=DRIVE_FOLDER_ID):
     folder = service.files().create(body=metadata, fields='id').execute()
     return folder.get('id')
 
-# --- স্ট্রাকচার অনুযায়ী জিপ এক্সট্র্যাক্ট এবং আপলোড ---
+# --- Extract ZIP ---
 async def upload_extracted_folder(extract_dir, base_folder_name, parent_id, msg, cancel_id, start_time):
     success, service = get_drive_service()
     base_g_id = service.files().create(body={'name': base_folder_name, 'mimeType': 'application/vnd.google-apps.folder', 'parents': [parent_id]}, fields='id').execute().get('id')
@@ -297,7 +298,6 @@ def extract_zip(zip_path, extract_dir):
     except Exception as e:
         return False, str(e)
 
-# --- ড্রাইভ ফাইল সার্ভারে ডাউনলোড ---
 async def download_gdrive_to_server(file_id, file_path, file_size, msg, cancel_id):
     success, service = get_drive_service()
     request = service.files().get_media(fileId=file_id)
@@ -310,11 +310,10 @@ async def download_gdrive_to_server(file_id, file_path, file_size, msg, cancel_i
             fh.close()
             raise Exception("CANCELLED")
         status, done = await asyncio.to_thread(functools.partial(downloader.next_chunk, num_retries=3))
-        # BUG FIX: status.resumable_progress is a property!
         if status: await update_progress(status.resumable_progress, file_size, msg, start_time, "📥 Downloading from GDrive...", cancel_id)
     fh.close()
 
-# ================= মেসেজ হ্যান্ডলারস =================
+# ================= MESSAGE HANDLERS =================
 @app.on_message(filters.command("start"))
 async def start_command(client, message):
     if not check_auth(message.from_user.id): return
@@ -361,7 +360,7 @@ async def handle_text_input(client, message):
 
     if not re.match(r"http[s]?://", url): return
 
-    # --- ড্রাইভ লিংক ম্যানেজমেন্ট (Private Link Bug Fixed) ---
+    # --- Drive Link Handling ---
     g_id, is_folder = extract_gdrive_id(url)
     if g_id:
         if is_folder:
@@ -388,13 +387,12 @@ async def handle_text_input(client, message):
                 
                 await msg.edit_text(f"🔗 **GDrive File Detected!**\n📄 Name: `{name}`\n📦 Size: `{format_size(size)}`\n\nSelect action:", reply_markup=InlineKeyboardMarkup(btns))
             except HttpError as e:
-                # প্রাইভেট ফাইল হলে এই ব্লকে আসবে
                 await msg.edit_text("❌ **File Not Found or Access Denied!**\nPlease make sure the GDrive link is public and the file exists.")
             except Exception as e:
                 await msg.edit_text("❌ **File Not Found!**")
             return
 
-    # --- ডিরেক্ট লিংক ম্যানেজমেন্ট ---
+    # --- Direct Link Handling ---
     msg = await message.reply_text("🔍 Fetching Metadata...")
     name, size = await get_url_metadata(url)
     LINK_CACHE[message.id] = {"url": url, "name": name, "size": size, "is_gd": False}
@@ -405,7 +403,7 @@ async def handle_text_input(client, message):
     size_str = format_size(size) if size > 0 else "Unknown"
     await msg.edit_text(f"🔗 **Direct Link Detected!**\n📄 Name: `{name}`\n📦 Size: `{size_str}`\n\nSelect action:", reply_markup=InlineKeyboardMarkup(btns))
 
-# ================= প্রধান ডাউনলোড ও আপলোড লজিক =================
+# ================= DOWNLOAD & UPLOAD PROCESS =================
 async def process_download(client, message, url, file_name, extract=False):
     msg = await app.send_message(message.chat.id, "📥 Preparing...")
     file_path = os.path.join(os.getcwd(), file_name)
@@ -428,7 +426,6 @@ async def process_download(client, message, url, file_name, extract=False):
             await msg.edit_text(generate_result_text(file_name, res.get('id'), gd_size, time.time()-start_time))
             return
         else:
-            # ⚡ স্মার্ট প্যারালাল (মাল্টি-কানেকশন) ডাউনলোড লজিক ⚡
             connector = aiohttp.TCPConnector(limit=20)
             async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=0)) as session:
                 supports_range = False
@@ -453,7 +450,6 @@ async def process_download(client, message, url, file_name, extract=False):
                         tasks.append(download_part(session, url, start, end, part_path, progress, msg, start_time, cancel_id))
                     
                     await asyncio.gather(*tasks) 
-                    
                     if CANCEL_FLAGS.get(cancel_id): raise Exception("CANCELLED")
                     
                     await msg.edit_text("⚙️ Merging downloaded parts...", reply_markup=get_cancel_markup(cancel_id))
@@ -474,14 +470,12 @@ async def process_download(client, message, url, file_name, extract=False):
                                 downloaded += len(chunk)
                                 if total_size > 0: await update_progress(downloaded, total_size, msg, start_time, "📥 Downloading...", cancel_id)
 
-        # জিপ এক্সট্রাকশন হ্যান্ডলিং
         if extract and file_name.lower().endswith('.zip'):
             await msg.edit_text("📦 Extracting ZIP...")
             ext_dir = file_path + "_ext"
             os.makedirs(ext_dir, exist_ok=True)
             success, ext_res = await asyncio.to_thread(extract_zip, file_path, ext_dir)
-            if not success:
-                return await msg.edit_text(f"❌ Extraction Error: {ext_res}")
+            if not success: return await msg.edit_text(f"❌ Extraction Error: {ext_res}")
             
             f_name = file_name.replace(".zip", "")
             t_files, new_f_id = await upload_extracted_folder(ext_dir, f_name, DRIVE_FOLDER_ID, msg, cancel_id, start_time)
@@ -490,7 +484,6 @@ async def process_download(client, message, url, file_name, extract=False):
             shutil.rmtree(ext_dir, ignore_errors=True)
             return
 
-        # ভিডিও প্রিভিউ অ্যালবামের জন্য
         preview_id = None
         if file_name.lower().endswith(('.mp4', '.mkv', '.avi', '.webm')):
             await msg.edit_text("🎬 Extracting Frames...", reply_markup=get_cancel_markup(cancel_id))
@@ -500,21 +493,20 @@ async def process_download(client, message, url, file_name, extract=False):
                 preview_id = p_id
                 PREVIEW_CACHE[preview_id] = frames
 
-        # ড্রাইভ আপলোড
         success, file_id, file_size, up_time = await upload_to_drive_async(file_path, file_name, msg, cancel_id=cancel_id)
         
         if success:
             txt = generate_result_text(file_name, file_id, file_size, time.time() - start_time)
             rm = InlineKeyboardMarkup([[InlineKeyboardButton("🎬 View Preview", callback_data=f"pv|{preview_id}")]]) if preview_id else None
             await msg.edit_text(txt, reply_markup=rm)
-        else:
-            await msg.edit_text(f"❌ Upload Failed: {file_id}")
+        else: await msg.edit_text(f"❌ Upload Failed: {file_id}")
 
     except Exception as e:
         if str(e) == "CANCELLED": await msg.edit_text("🚫 **Task Cancelled by User!**")
         else: await msg.edit_text(f"❌ Error: {get_safe_error(e)}")
     finally:
         CANCEL_FLAGS.pop(cancel_id, None)
+        PROGRESS_CACHE.pop(cancel_id, None)
         if file_path and os.path.exists(file_path): os.remove(file_path)
         for i in range(4):
             part_p = f"{file_path}.part{i}"
@@ -529,10 +521,14 @@ async def handle_telegram_files(client, message):
     start_time = time.time()
     cancel_id = str(message.id)
     CANCEL_FLAGS[cancel_id] = False
+    file_path = None
     
     try:
+        # BUG FIX: Stable Telegram Downloading without attributes error
         file_path = await message.download(progress=update_progress, progress_args=(msg, start_time, "📥 Downloading from Telegram...", cancel_id))
+        
         if CANCEL_FLAGS.get(cancel_id): raise Exception("CANCELLED")
+        if not file_path: raise Exception("Download failed or was empty.")
         
         file_name = os.path.basename(file_path)
         
@@ -550,9 +546,7 @@ async def handle_telegram_files(client, message):
         if success:
             total_elapsed = time.time() - start_time
             text = generate_result_text(file_name, file_id, file_size, total_elapsed)
-            reply_markup = None
-            if preview_id:
-                reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🎬 View Preview", callback_data=f"pv|{preview_id}")]])
+            reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🎬 View Preview", callback_data=f"pv|{preview_id}")]]) if preview_id else None
             await msg.edit_text(text, reply_markup=reply_markup)
         else:
             await msg.edit_text(f"❌ Upload failed.\nReason: {file_id}")
@@ -561,9 +555,10 @@ async def handle_telegram_files(client, message):
         else: await msg.edit_text(f"❌ Error: {get_safe_error(e)}")
     finally:
         CANCEL_FLAGS.pop(cancel_id, None)
-        if 'file_path' in locals() and file_path and os.path.exists(file_path): os.remove(file_path)
+        PROGRESS_CACHE.pop(cancel_id, None)
+        if file_path and os.path.exists(file_path): os.remove(file_path)
 
-# ================= কলব্যাক বাটন হ্যান্ডলারস =================
+# ================= CALLBACKS =================
 @app.on_callback_query()
 async def callback_handler(client, query: CallbackQuery):
     data = query.data.split("|")
@@ -592,10 +587,9 @@ async def callback_handler(client, query: CallbackQuery):
             await query.answer("Sending 10 frames...")
             media = [InputMediaPhoto(p) for p in paths]
             await app.send_media_group(query.message.chat.id, media)
-        else:
-            await query.answer("Preview expired or not available.", show_alert=True)
+        else: await query.answer("Preview expired or not available.", show_alert=True)
 
-# ================= অতিরিক্ত কমান্ডস (Stats, Storage, MyFiles) =================
+# ================= OTHER COMMANDS =================
 @app.on_message(filters.command("stats"))
 async def stats_command(client, message):
     if not check_auth(message.from_user.id): return
