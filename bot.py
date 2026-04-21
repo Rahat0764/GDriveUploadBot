@@ -10,17 +10,21 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
+# Environment Variables
 API_ID = os.environ.get("API_ID")
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID")
 GOOGLE_CREDS_STR = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 
+# Authorized Users Setup
 AUTH_USERS_STR = os.environ.get("AUTHORIZED_USERS", "")
 AUTHORIZED_USERS = [int(u.strip()) for u in AUTH_USERS_STR.split(",") if u.strip().isdigit()]
 
+# Google Drive API scopes
 SCOPES = ['https://www.googleapis.com/auth/drive.file']
 
+# Flask Web Server setup
 app_web = Flask(__name__)
 
 @app_web.route('/')
@@ -29,8 +33,14 @@ def home():
 
 def run_web_server():
     port = int(os.environ.get("PORT", 8080))
-    app_web.run(host="0.0.0.0", port=port)
+    # Flask needs to run in a separate thread but must not block
+    app_web.run(host="0.0.0.0", port=port, use_reloader=False)
 
+# Start web server in a background thread immediately
+web_thread = threading.Thread(target=run_web_server, daemon=True)
+web_thread.start()
+
+# Telegram Bot Initialization
 app = Client(
     "my_drive_bot",
     api_id=int(API_ID) if API_ID else None,
@@ -39,6 +49,7 @@ app = Client(
 )
 
 def get_drive_service():
+    """Initializes and returns the Google Drive service."""
     try:
         creds_dict = json.loads(GOOGLE_CREDS_STR)
         creds = service_account.Credentials.from_service_account_info(
@@ -49,9 +60,11 @@ def get_drive_service():
         return None
 
 def format_size(bytes_size):
+    """Formats bytes to MB."""
     return f"{bytes_size / (1024 * 1024):.2f} MB"
 
 async def update_progress(current, total, msg, start_time, action_text):
+    """Updates the progress message with a visual bar and speed."""
     if total == 0:
         return
 
@@ -59,7 +72,8 @@ async def update_progress(current, total, msg, start_time, action_text):
     if not hasattr(msg, "last_update_time"):
         msg.last_update_time = start_time
 
-    if (now - msg.last_update_time > 2.0) or (current == total):
+    # Update every 3 seconds to avoid FloodWait limits
+    if (now - msg.last_update_time > 3.0) or (current == total):
         msg.last_update_time = now
         
         percent = (current / total) * 100
@@ -78,9 +92,10 @@ async def update_progress(current, total, msg, start_time, action_text):
         try:
             await msg.edit_text(text)
         except Exception:
-            pass
+            pass # Ignore minor edit errors
 
 async def upload_to_drive_async(file_path, file_name, msg):
+    """Uploads file to Drive asynchronously, updating progress."""
     try:
         service = get_drive_service()
         if not service:
@@ -96,6 +111,7 @@ async def upload_to_drive_async(file_path, file_name, msg):
         start_time = time.time()
         
         while response is None:
+            # Run the blocking upload chunk in a separate thread
             status, response = await asyncio.to_thread(request.next_chunk)
             if status:
                 await update_progress(
@@ -108,9 +124,12 @@ async def upload_to_drive_async(file_path, file_name, msg):
         return None
 
 def check_auth(user_id):
+    """Checks if the user is authorized to use the bot."""
     if not AUTHORIZED_USERS:
         return True
     return user_id in AUTHORIZED_USERS
+
+# Message Handlers
 
 @app.on_message(filters.command("start"))
 async def start_command(client, message):
@@ -194,6 +213,5 @@ async def handle_links(client, message):
         await msg.edit_text(f"❌ Error handling link: {e}")
 
 if __name__ == "__main__":
-    threading.Thread(target=run_web_server, daemon=True).start()
     print("Bot is starting...")
     app.run()
