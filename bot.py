@@ -2,8 +2,18 @@ import os
 import sys
 import json
 import time
-import asyncio
 import logging
+import asyncio
+
+# ================= CRITICAL FIX FOR PYTHON 3.14+ =================
+# Pyrogram crashes on import in Python 3.14+ if an event loop is not already set.
+# We MUST create and set the event loop BEFORE importing Pyrogram.
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+# =================================================================
+
 import aiohttp
 from aiohttp import web
 from pyrogram import Client, filters, idle
@@ -12,7 +22,6 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 # ================= LOGGING SETUP =================
-# This forces Render to display all logs properly
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -63,7 +72,7 @@ app = Client(
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    in_memory=True  # Safest option for Cloud Hosting (prevents SQLite lock)
+    in_memory=True  # Safest option for Cloud Hosting
 )
 
 def get_drive_service():
@@ -260,7 +269,9 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        # We fetch the loop we created at the top of the file
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(main())
     except KeyboardInterrupt:
         logger.info("Bot stopped by user.")
     except Exception as e:
