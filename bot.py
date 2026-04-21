@@ -4,18 +4,14 @@ import time
 import asyncio
 import aiohttp
 from aiohttp import web
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 # Environment Variables
-API_ID_STR = os.environ.get("API_ID", "0")
-try:
-    API_ID = int(API_ID_STR)
-except ValueError:
-    API_ID = 0
-
+API_ID_STR = os.environ.get("API_ID")
+API_ID = int(API_ID_STR) if API_ID_STR and API_ID_STR.isdigit() else None
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID")
@@ -39,6 +35,9 @@ app = Client(
 def get_drive_service():
     """Initializes and returns the Google Drive service."""
     try:
+        if not GOOGLE_CREDS_STR:
+            print("Credentials JSON is missing in Environment Variables.")
+            return None
         creds_dict = json.loads(GOOGLE_CREDS_STR)
         creds = service_account.Credentials.from_service_account_info(
             creds_dict, scopes=SCOPES)
@@ -199,31 +198,28 @@ async def handle_links(client, message):
     except Exception as e:
         await msg.edit_text(f"❌ Error handling link: {e}")
 
-async def start_web_server():
-    """Starts a lightweight aiohttp web server for UptimeRobot."""
-    async def handle(request):
-        return web.Response(text="Bot is perfectly running 24/7!")
-        
+# ================= MAIN RUNNER =================
+async def main():
+    print("Starting web server...")
     app_web = web.Application()
-    app_web.router.add_get('/', handle)
+    app_web.router.add_get('/', lambda r: web.Response(text="Bot is perfectly running 24/7!"))
     runner = web.AppRunner(app_web)
     await runner.setup()
+    
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     print(f"Web server started on port {port}")
 
+    print("Starting Pyrogram Bot...")
+    await app.start()
+    print("Bot is successfully running!")
+    
+    # Keeps the script running to receive updates
+    await idle()
+    
+    await app.stop()
+
 if __name__ == "__main__":
-    print("Starting initialization...")
-    try:
-        # Create a single native event loop for both Web Server and Pyrogram
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        print("Starting web server...")
-        loop.run_until_complete(start_web_server())
-        
-        print("Starting Pyrogram Bot...")
-        app.run()
-    except Exception as e:
-        print(f"CRITICAL ERROR: {e}")
+    # Python 3.10+ / 3.14 safe asyncio runner
+    asyncio.run(main())
