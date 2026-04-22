@@ -5,5 +5,7 @@ google-auth-httplib2
 google-auth-oauthlib
 requests
 aiohttp
+aiofiles
+cachetools
 opencv-python-headless
 Pillow
