@@ -60,14 +60,14 @@ def setup_binaries_and_config():
                 "access_token": td.get("token", ""),
                 "token_type": "Bearer",
                 "refresh_token": td.get("refresh_token", ""),
-                "expiry": "2030-01-01T00:00:00.000000000Z" # Force refresh if needed
+                "expiry": "2030-01-01T00:00:00.000000000Z"
             }
             conf = f"[gdrive]\ntype = drive\nclient_id = {td.get('client_id','')}\nclient_secret = {td.get('client_secret','')}\nscope = drive\ntoken = {json.dumps(rclone_token)}\nroot_folder_id = {DRIVE_FOLDER_ID}\n"
             with open("rclone.conf", "w") as f: f.write(conf)
             print("✅ Rclone Config Generated!")
         except Exception as e: print("❌ Rclone Config Error:", e)
 
-    # 2. Download and Setup Using Native Linux Shell (Fixes all 404/bzip2 errors)
+    # 2. Download and Setup Using Native Linux Shell
     if not os.path.exists("./rclone"):
         print("⬇️ Shell Downloading Rclone...")
         os.system('wget -qO rclone.zip "https://downloads.rclone.org/rclone-current-linux-amd64.zip"')
@@ -77,14 +77,14 @@ def setup_binaries_and_config():
         os.system('rm -rf rclone.zip rclone-*-linux-amd64')
 
     if not os.path.exists("./aria2c"):
-        print("⬇️ Shell Downloading Aria2c...")
-        os.system('wget -qO aria2.tar.bz2 "https://github.com/q3aql/aria2-static-builds/releases/download/v1.36.0/aria2-1.36.0-linux-gnu-64bit-build1.tar.bz2"')
-        os.system('tar -xjf aria2.tar.bz2')
-        os.system('mv aria2-1.36.0-linux-gnu-64bit-build1/aria2c ./aria2c 2>/dev/null')
+        print("⬇️ Shell Downloading Aria2c (v1.37.0 Static Build)...")
+        # Direct static binary tar.gz from P3TERX (No extraction errors)
+        os.system('wget -qO aria2.tar.gz "https://github.com/P3TERX/Aria2-Pro-Core/releases/download/1.37.0/aria2-1.37.0-static-linux-amd64.tar.gz"')
+        os.system('tar -xzf aria2.tar.gz')
         os.system('chmod +x ./aria2c')
-        os.system('rm -rf aria2.tar.bz2 aria2-1.36.0-linux-gnu-64bit-build1')
+        os.system('rm -rf aria2.tar.gz')
 
-    if os.path.exists("./aria2c"): print("✅ Aria2c Ready!")
+    if os.path.exists("./aria2c"): print("✅ Aria2c (v1.37.0) Ready!")
     else: print("❌ Aria2c Setup Failed!")
         
     if os.path.exists("./rclone"): print("✅ Rclone Ready!")
@@ -323,7 +323,6 @@ async def download_with_aria2(url, file_path, msg, cancel_id):
 async def upload_with_rclone(file_path, file_name, msg, parent_id=DRIVE_FOLDER_ID, cancel_id=None, start_time=None):
     is_dir = os.path.isdir(file_path)
     
-    # Rclone path configuration based on directory or single file
     if is_dir:
         cmd = ["./rclone", "copy", file_path, f"gdrive:{file_name}", "--config", "rclone.conf", "-P"]
     else:
@@ -746,7 +745,7 @@ async def general_cb(client, query):
 # ================= WEB SERVER FOR RENDER =================
 async def start_web_server():
     app_web = web.Application()
-    app_web.router.add_get('/', lambda r: web.Response(text="🚀 Ultimate SpeedPro Bot is Running on Render!"))
+    app_web.router.add_get('/', lambda r: web.Response(text="🚀 Ultimate SpeedPro Bot (v1.37.0) is Running on Render!"))
     runner = web.AppRunner(app_web)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', PORT).start()
@@ -754,7 +753,7 @@ async def start_web_server():
 async def main():
     await start_web_server()
     await app.start()
-    logger.info("Bot LIVE on Render with Aria2 & Rclone! 🚀")
+    logger.info("Bot LIVE on Render with Aria2 v1.37.0 & Rclone! 🚀")
     await idle()
     await app.stop()
 
