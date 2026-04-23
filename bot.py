@@ -14,6 +14,7 @@ import tarfile
 import stat
 import io
 import requests
+import glob
 
 try: asyncio.get_event_loop()
 except RuntimeError: asyncio.set_event_loop(asyncio.new_event_loop())
@@ -51,11 +52,11 @@ PORT = int(os.environ.get("PORT", 8080))
 AUTHORIZED_USERS = [int(u.strip()) for u in AUTH_USERS_STR.split(",") if u.strip().isdigit()]
 SCOPES = ['https://www.googleapis.com/auth/drive']
 
-# ================= AUTO SETUP ARIA2 & RCLONE (FIXED) =================
+# ================= AUTO SETUP ARIA2 & RCLONE (FOOLPROOF) =================
 def setup_binaries_and_config():
     print("⚙️ Initializing Server Environment...")
     
-    # 1. Generate Rclone Config
+    # 1. Rclone Config Generation
     if GOOGLE_OAUTH_TOKEN:
         try:
             td = json.loads(GOOGLE_OAUTH_TOKEN)
@@ -64,43 +65,43 @@ def setup_binaries_and_config():
             print("✅ Rclone Config Generated!")
         except Exception as e: print("❌ Rclone Config Error:", e)
 
-    # 2. Download Rclone (Latest version)
+    # 2. Rclone Download & Extract
     if not os.path.exists("./rclone"):
         print("⬇️ Downloading Rclone...")
         try:
             res = requests.get("https://downloads.rclone.org/rclone-current-linux-amd64.zip")
             with open("rclone.zip", "wb") as f: f.write(res.content)
-            with zipfile.ZipFile("rclone.zip", 'r') as z:
-                for info in z.infolist():
-                    if info.filename.endswith("/rclone") and not info.is_dir():
-                        info.filename = "rclone"
-                        z.extract(info, ".")
-            os.chmod("./rclone", 0o755) # Give execution permission
-            os.remove("rclone.zip")
+            with zipfile.ZipFile("rclone.zip", 'r') as z: z.extractall("rclone_temp")
+            
+            # Find and move the binary using glob
+            r_paths = glob.glob("rclone_temp/**/rclone", recursive=True)
+            if r_paths:
+                shutil.move(r_paths[0], "./rclone")
+                os.chmod("./rclone", 0o755)
+            shutil.rmtree("rclone_temp", ignore_errors=True)
+            if os.path.exists("rclone.zip"): os.remove("rclone.zip")
             print("✅ Rclone Ready!")
-        except Exception as e: print("❌ Failed to download Rclone:", e)
+        except Exception as e: print("❌ Rclone setup failed:", e)
 
-    # 3. Download Aria2c (Reliable Static Build Mirror)
+    # 3. Aria2c Download & Extract
     if not os.path.exists("./aria2c"):
         print("⬇️ Downloading Aria2c...")
         try:
-            # Most reliable Linux 64-bit static build mirror
             url = "https://github.com/q3aql/aria2-static-builds/releases/download/v1.36.0/aria2-1.36.0-linux-gnu-64bit-build1.tar.bz2"
             res = requests.get(url)
             with open("aria2.tar.bz2", "wb") as f: f.write(res.content)
+            with tarfile.open("aria2.tar.bz2", "r:bz2") as tar: tar.extractall("aria2_temp")
             
-            with tarfile.open("aria2.tar.bz2", "r:bz2") as tar:
-                for member in tar.getmembers():
-                    if member.name.endswith("/aria2c") and member.isfile():
-                        member.name = "aria2c"
-                        tar.extract(member, ".")
-            
-            os.chmod("./aria2c", 0o755) # Give execution permission
-            os.remove("aria2.tar.bz2")
+            # Find and move the binary using glob
+            a_paths = glob.glob("aria2_temp/**/aria2c", recursive=True)
+            if a_paths:
+                shutil.move(a_paths[0], "./aria2c")
+                os.chmod("./aria2c", 0o755)
+            shutil.rmtree("aria2_temp", ignore_errors=True)
+            if os.path.exists("aria2.tar.bz2"): os.remove("aria2.tar.bz2")
             print("✅ Aria2c Ready!")
-        except Exception as e: print("❌ Failed to download Aria2c:", e)
+        except Exception as e: print("❌ Aria2c setup failed:", e)
 
-# Run the setup before starting the bot
 setup_binaries_and_config()
 
 # ================= LOGGING SETUP =================
@@ -213,32 +214,113 @@ def generate_10_video_frames(video_path, preview_id):
         return paths
     except: return []
 
-# ================= CORE: ARIA2 & RCLONE =================
+# ================= CORE: DOWNLOAD & UPLOAD ENGINES =================
+
+async def update_progress(current, total, msg, start_time, action_text, cancel_id=None):
+    if cancel_id and CANCEL_FLAGS.get(cancel_id): raise Exception("CANCELLED")
+    if total == 0: total = current + 1 
+    now = time.time()
+    
+    if (now - getattr(update_progress, "last_time", 0) > 3.0) or (current == total):
+        update_progress.last_time = now
+        percent = min(100.0, (current / total) * 100)
+        filled = int(percent / 10)
+        bar = "🟩" * filled + "⬜" * (10 - filled)
+        elapsed = now - start_time
+        speed = current / elapsed if elapsed > 0 else 0
+        eta = (total - current) / speed if speed > 0 else 0
+        
+        text = f"{action_text}\n\n{bar} {percent:.1f}%\n📦 Size: {format_size(current)} / {format_size(total)}\n🚀 Speed: {format_size(speed)}/s\n⏳ ETA: {format_time(eta)}"
+        try: await msg.edit_text(text, reply_markup=get_cancel_markup(cancel_id) if cancel_id else None)
+        except MessageNotModified: pass
+
+async def download_part(session, url, start, end, part_path, progress, msg, start_time, cancel_id):
+    headers = {'Range': f'bytes={start}-{end}'}
+    async with session.get(url, headers=headers) as resp:
+        resp.raise_for_status()
+        async with aiofiles.open(part_path, 'wb') as f:
+            async for chunk in resp.content.iter_chunked(2 * 1024 * 1024):
+                if CANCEL_FLAGS.get(cancel_id): raise Exception("CANCELLED")
+                await f.write(chunk)
+                progress['downloaded'] += len(chunk)
+                await update_progress(progress['downloaded'], progress['total'], msg, start_time, "⚡ Parallel Python DL...", cancel_id)
+
+def merge_files_sync(file_path, num_parts):
+    with open(file_path, 'wb') as outfile:
+        for i in range(num_parts):
+            part_path = f"{file_path}.part{i}"
+            with open(part_path, 'rb') as infile:
+                shutil.copyfileobj(infile, outfile, length=4*1024*1024)
+            os.remove(part_path)
+
+async def download_with_python_native(url, file_path, msg, cancel_id, link_data):
+    start_time = time.time()
+    connector = aiohttp.TCPConnector(limit=10)
+    async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=0)) as session:
+        supports_range = False
+        total_size = link_data.get("size", 0)
+        try:
+            async with session.head(url, allow_redirects=True) as head_resp:
+                supports_range = head_resp.headers.get('Accept-Ranges') == 'bytes'
+                if total_size == 0: total_size = int(head_resp.headers.get('content-length', 0))
+        except: pass
+
+        if supports_range and total_size > 10 * 1024 * 1024:
+            num_parts = 4 
+            part_size = total_size // num_parts
+            tasks = []
+            progress = {'downloaded': 0, 'total': total_size}
+            for i in range(num_parts):
+                start = i * part_size
+                end = total_size - 1 if i == num_parts - 1 else (start + part_size - 1)
+                part_path = f"{file_path}.part{i}"
+                tasks.append(download_part(session, url, start, end, part_path, progress, msg, start_time, cancel_id))
+            await asyncio.gather(*tasks) 
+            if CANCEL_FLAGS.get(cancel_id): raise Exception("CANCELLED")
+            await msg.edit_text("⚙️ Merging Parts...", reply_markup=get_cancel_markup(cancel_id))
+            await asyncio.to_thread(merge_files_sync, file_path, num_parts)
+        else:
+            async with session.get(url) as response:
+                response.raise_for_status()
+                downloaded = 0
+                async with aiofiles.open(file_path, 'wb') as f:
+                    async for chunk in response.content.iter_chunked(2 * 1024 * 1024): 
+                        if CANCEL_FLAGS.get(cancel_id): raise Exception("CANCELLED")
+                        await f.write(chunk)
+                        downloaded += len(chunk)
+                        if total_size > 0: await update_progress(downloaded, total_size, msg, start_time, "📥 Native Downloading...", cancel_id)
+
+async def upload_with_python_native(file_path, file_name, msg, parent_id=DRIVE_FOLDER_ID, cancel_id=None):
+    success, service = get_drive_service()
+    if not success: return False, service, 0, 0
+    file_size = os.path.getsize(file_path)
+    media = MediaFileUpload(file_path, chunksize=20*1024*1024, resumable=True) 
+    request = service.files().create(body={'name': file_name, 'parents': [parent_id]}, media_body=media, fields='id')
+    
+    response, start_time = None, time.time()
+    while response is None:
+        if cancel_id and CANCEL_FLAGS.get(cancel_id): raise Exception("CANCELLED")
+        status, response = await asyncio.to_thread(functools.partial(request.next_chunk, num_retries=5))
+        if status: await update_progress(status.resumable_progress, file_size, msg, start_time, "☁️ Native Uploading...", cancel_id)
+            
+    BOT_STATS["uploads"] += 1
+    BOT_STATS["bytes_uploaded"] += file_size
+    return True, response.get('id'), file_size, time.time() - start_time
 
 async def download_with_aria2(url, file_path, msg, cancel_id):
     dir_name = os.path.dirname(file_path) if os.path.dirname(file_path) else "."
     file_name = os.path.basename(file_path)
     
-    cmd = [
-        "./aria2c", 
-        "--dir", dir_name, 
-        "--out", file_name, 
-        "--split=4", "--max-connection-per-server=4", "--min-split-size=10M",
-        "--summary-interval=3", "-x4",
-        url
-    ]
+    cmd = ["./aria2c", "--dir", dir_name, "--out", file_name, "--split=4", "--max-connection-per-server=4", "--min-split-size=10M", "--summary-interval=3", "-x4", url]
     process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
     
     last_update = time.time()
     while True:
-        if CANCEL_FLAGS.get(cancel_id):
-            process.terminate()
-            raise Exception("CANCELLED")
+        if CANCEL_FLAGS.get(cancel_id): process.terminate(); raise Exception("CANCELLED")
         line = await process.stdout.readline()
         if not line: break
         text = line.decode('utf-8').strip()
         
-        # Parse Aria2 Progress
         if text.startswith("[#") and "DL:" in text and (time.time() - last_update > 3):
             try: 
                 await msg.edit_text(f"⚡ **Aria2c Fast Downloading...**\n\n`{text}`", reply_markup=get_cancel_markup(cancel_id))
@@ -252,20 +334,12 @@ async def upload_with_rclone(file_path, file_name, msg, parent_id=DRIVE_FOLDER_I
     is_dir = os.path.isdir(file_path)
     rclone_dest = f"gdrive:{file_name}" if not is_dir else f"gdrive:/{file_name}"
     
-    cmd = [
-        "./rclone", "copy" if is_dir else "copyto", file_path, rclone_dest,
-        "--config", "rclone.conf",
-        "--drive-root-folder-id", parent_id,
-        "--stats", "3s", "-P"
-    ]
-    
+    cmd = ["./rclone", "copy" if is_dir else "copyto", file_path, rclone_dest, "--config", "rclone.conf", "--drive-root-folder-id", parent_id, "--stats", "3s", "-P"]
     process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
     last_update = time.time()
     
     while True:
-        if CANCEL_FLAGS.get(cancel_id):
-            process.terminate()
-            raise Exception("CANCELLED")
+        if CANCEL_FLAGS.get(cancel_id): process.terminate(); raise Exception("CANCELLED")
         line = await process.stdout.readline()
         if not line: break
         text = line.decode('utf-8').strip()
@@ -350,8 +424,13 @@ async def process_download(client, message, url, file_name, extract=False):
             return
             
         if not is_gd:
-            await msg.edit_text("⚡ Starting Aria2c Downloader...", reply_markup=get_cancel_markup(cancel_id))
-            await download_with_aria2(url, file_path, msg, cancel_id)
+            # FALLBACK SYSTEM FOR DOWNLOADING
+            if os.path.exists("./aria2c"):
+                await msg.edit_text("⚡ Starting Aria2c Downloader...", reply_markup=get_cancel_markup(cancel_id))
+                await download_with_aria2(url, file_path, msg, cancel_id)
+            else:
+                await msg.edit_text("⚡ Starting Native Python Downloader...", reply_markup=get_cancel_markup(cancel_id))
+                await download_with_python_native(url, file_path, msg, cancel_id, link_data)
         else:
             success, service = get_drive_service()
             request = service.files().get_media(fileId=gd_id)
@@ -374,9 +453,15 @@ async def process_download(client, message, url, file_name, extract=False):
             if not success: return await msg.edit_text(f"❌ Extraction Error: {ext_res}")
             
             f_name = file_name.replace(".zip", "")
-            await msg.edit_text("☁️ Rclone Uploading Extracted Folder...", reply_markup=get_cancel_markup(cancel_id))
-            up_success, new_f_id, _, _ = await upload_with_rclone(ext_dir, f_name, msg, DRIVE_FOLDER_ID, cancel_id, start_time)
             
+            # FALLBACK SYSTEM FOR EXTRACTED FOLDER UPLOAD
+            if os.path.exists("./rclone"):
+                await msg.edit_text("☁️ Rclone Uploading Extracted Folder...", reply_markup=get_cancel_markup(cancel_id))
+                up_success, new_f_id, _, _ = await upload_with_rclone(ext_dir, f_name, msg, DRIVE_FOLDER_ID, cancel_id, start_time)
+            else:
+                await msg.edit_text("☁️ Native Python Uploading Extracted Folder...", reply_markup=get_cancel_markup(cancel_id))
+                up_success, new_f_id = await upload_extracted_folder(ext_dir, f_name, DRIVE_FOLDER_ID, msg, cancel_id, start_time)
+
             if up_success:
                 await msg.edit_text(generate_result_text(f_name, new_f_id, 0, time.time()-start_time, True))
             else: await msg.edit_text("❌ Extracted Folder Upload Failed")
@@ -392,8 +477,13 @@ async def process_download(client, message, url, file_name, extract=False):
                 preview_id = p_id
                 PREVIEW_CACHE[preview_id] = frames
 
-        await msg.edit_text("☁️ Starting Rclone Upload...", reply_markup=get_cancel_markup(cancel_id))
-        success, file_id, file_size, up_time = await upload_with_rclone(file_path, file_name, msg, DRIVE_FOLDER_ID, cancel_id, start_time)
+        # FALLBACK SYSTEM FOR FILE UPLOAD
+        if os.path.exists("./rclone"):
+            await msg.edit_text("☁️ Starting Rclone Upload...", reply_markup=get_cancel_markup(cancel_id))
+            success, file_id, file_size, up_time = await upload_with_rclone(file_path, file_name, msg, DRIVE_FOLDER_ID, cancel_id, start_time)
+        else:
+            await msg.edit_text("☁️ Starting Native Python Upload...", reply_markup=get_cancel_markup(cancel_id))
+            success, file_id, file_size, up_time = await upload_with_python_native(file_path, file_name, msg, DRIVE_FOLDER_ID, cancel_id)
         
         if success:
             txt = generate_result_text(file_name, file_id, file_size, time.time() - start_time)
@@ -414,13 +504,32 @@ async def process_download(client, message, url, file_name, extract=False):
 @app.on_message(filters.command("start"))
 async def start_command(client, message):
     if not check_auth(message.from_user.id): return
-    await message.reply_text("🚀 **SpeedPro (Aria2+Rclone) Ready!**\nSend me a Link, GDrive Link, or File.\n\n/myfiles, /search <name>, /stats")
+    await message.reply_text("🚀 **SpeedPro (Aria2+Rclone) Ready!**\nSend me a Link, GDrive Link, or File.\n\n/myfiles, /search <name>, /stats, /storage, /logs")
 
 @app.on_message(filters.command("stats"))
 async def stats_command(client, message):
     if not check_auth(message.from_user.id): return
     text = f"📊 **Bot Current Session Stats:**\n\n📤 Uploads: `{BOT_STATS['uploads']}`\n🔄 Clones: `{BOT_STATS['clones']}`\n💾 Uploaded: `{format_size(BOT_STATS['bytes_uploaded'])}`"
     await message.reply_text(text)
+
+@app.on_message(filters.command("logs"))
+async def logs_command(client, message):
+    if not check_auth(message.from_user.id): return
+    logs_txt = "\n".join(memory_handler.logs) if memory_handler.logs else "No recent logs."
+    await message.reply_text(f"📜 **Recent Logs:**\n`{logs_txt[-3000:]}`")
+
+@app.on_message(filters.command("storage"))
+async def storage_command(client, message):
+    if not check_auth(message.from_user.id): return
+    success, service = get_drive_service()
+    if not success: return await message.reply_text("Auth Error.")
+    try:
+        about = service.about().get(fields="storageQuota").execute()
+        quota = about.get('storageQuota', {})
+        limit, usage = int(quota.get('limit', 0)), int(quota.get('usage', 0))
+        text = f"💾 **Drive Storage:**\n\n**Used:** `{format_size(usage)}`\n" + (f"**Total:** `Unlimited`" if limit == 0 else f"**Free:** `{format_size(limit - usage)}`\n**Total:** `{format_size(limit)}`")
+        await message.reply_text(text)
+    except Exception as e: await message.reply_text(f"Storage info fetch failed: {e}")
 
 @app.on_message(filters.command("search"))
 async def search_command(client, message):
@@ -516,8 +625,13 @@ async def handle_telegram_files(client, message):
         file_path = await message.download(progress=prog_cb)
         if CANCEL_FLAGS.get(cancel_id): raise Exception("CANCELLED")
         
-        await msg.edit_text("☁️ Rclone Uploading...", reply_markup=get_cancel_markup(cancel_id))
-        success, file_id, file_size, up_time = await upload_with_rclone(file_path, os.path.basename(file_path), msg, DRIVE_FOLDER_ID, cancel_id, start_time)
+        if os.path.exists("./rclone"):
+            await msg.edit_text("☁️ Rclone Uploading...", reply_markup=get_cancel_markup(cancel_id))
+            success, file_id, file_size, up_time = await upload_with_rclone(file_path, os.path.basename(file_path), msg, DRIVE_FOLDER_ID, cancel_id, start_time)
+        else:
+            await msg.edit_text("☁️ Native Uploading...", reply_markup=get_cancel_markup(cancel_id))
+            success, file_id, file_size, up_time = await upload_with_python_native(file_path, os.path.basename(file_path), msg, DRIVE_FOLDER_ID, cancel_id)
+            
         if success:
             await msg.edit_text(generate_result_text(os.path.basename(file_path), file_id, file_size, time.time() - start_time))
         else: await msg.edit_text("❌ Upload Failed.")
@@ -593,7 +707,7 @@ async def general_cb(client, query):
 # ================= WEB SERVER FOR RENDER =================
 async def start_web_server():
     app_web = web.Application()
-    app_web.router.add_get('/', lambda r: web.Response(text="🚀 Ultimate SpeedPro Bot (Aria2+Rclone) is Running on Render!"))
+    app_web.router.add_get('/', lambda r: web.Response(text="🚀 Ultimate SpeedPro Bot (Aria2+Rclone/Fallback) is Running on Render!"))
     runner = web.AppRunner(app_web)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', PORT).start()
@@ -601,7 +715,7 @@ async def start_web_server():
 async def main():
     await start_web_server()
     await app.start()
-    logger.info("Bot LIVE on Render with Aria2 & Rclone! 🚀")
+    logger.info("Bot LIVE on Render with Aria2 & Rclone (and Fallbacks)! 🚀")
     await idle()
     await app.stop()
 
