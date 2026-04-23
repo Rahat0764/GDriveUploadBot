@@ -52,28 +52,33 @@ PORT = int(os.environ.get("PORT", 8080))
 AUTHORIZED_USERS = [int(u.strip()) for u in AUTH_USERS_STR.split(",") if u.strip().isdigit()]
 SCOPES = ['https://www.googleapis.com/auth/drive']
 
-# ================= AUTO SETUP ARIA2 & RCLONE (FOOLPROOF) =================
+# ================= AUTO SETUP ARIA2 & RCLONE =================
 def setup_binaries_and_config():
     print("⚙️ Initializing Server Environment...")
     
-    # 1. Rclone Config Generation
+    # 1. Rclone Config Generation (FIXED TOKEN FORMAT)
     if GOOGLE_OAUTH_TOKEN:
         try:
             td = json.loads(GOOGLE_OAUTH_TOKEN)
-            conf = f"[gdrive]\ntype = drive\nclient_id = {td.get('client_id','')}\nclient_secret = {td.get('client_secret','')}\nscope = drive\ntoken = {GOOGLE_OAUTH_TOKEN}\nroot_folder_id = {DRIVE_FOLDER_ID}\n"
+            # Convert Python token to Rclone compatible token
+            rclone_token = {
+                "access_token": td.get("token", ""),
+                "token_type": "Bearer",
+                "refresh_token": td.get("refresh_token", ""),
+                "expiry": "2030-01-01T00:00:00Z" # Force Rclone to use refresh token
+            }
+            conf = f"[gdrive]\ntype = drive\nclient_id = {td.get('client_id','')}\nclient_secret = {td.get('client_secret','')}\nscope = drive\ntoken = {json.dumps(rclone_token)}\nroot_folder_id = {DRIVE_FOLDER_ID}\n"
             with open("rclone.conf", "w") as f: f.write(conf)
-            print("✅ Rclone Config Generated!")
+            print("✅ Rclone Config Generated Successfully!")
         except Exception as e: print("❌ Rclone Config Error:", e)
 
-    # 2. Rclone Download & Extract
-    if not os.path.exists("./rclone"):
+    # 2. Rclone Download
+    if not os.path.exists(os.path.abspath("./rclone")):
         print("⬇️ Downloading Rclone...")
         try:
             res = requests.get("https://downloads.rclone.org/rclone-current-linux-amd64.zip")
             with open("rclone.zip", "wb") as f: f.write(res.content)
             with zipfile.ZipFile("rclone.zip", 'r') as z: z.extractall("rclone_temp")
-            
-            # Find and move the binary using glob
             r_paths = glob.glob("rclone_temp/**/rclone", recursive=True)
             if r_paths:
                 shutil.move(r_paths[0], "./rclone")
@@ -83,16 +88,14 @@ def setup_binaries_and_config():
             print("✅ Rclone Ready!")
         except Exception as e: print("❌ Rclone setup failed:", e)
 
-    # 3. Aria2c Download & Extract
-    if not os.path.exists("./aria2c"):
+    # 3. Aria2c Download
+    if not os.path.exists(os.path.abspath("./aria2c")):
         print("⬇️ Downloading Aria2c...")
         try:
             url = "https://github.com/q3aql/aria2-static-builds/releases/download/v1.36.0/aria2-1.36.0-linux-gnu-64bit-build1.tar.bz2"
             res = requests.get(url)
             with open("aria2.tar.bz2", "wb") as f: f.write(res.content)
             with tarfile.open("aria2.tar.bz2", "r:bz2") as tar: tar.extractall("aria2_temp")
-            
-            # Find and move the binary using glob
             a_paths = glob.glob("aria2_temp/**/aria2c", recursive=True)
             if a_paths:
                 shutil.move(a_paths[0], "./aria2c")
@@ -214,8 +217,7 @@ def generate_10_video_frames(video_path, preview_id):
         return paths
     except: return []
 
-# ================= CORE: DOWNLOAD & UPLOAD ENGINES =================
-
+# ================= CORE: ENGINES & FALLBACKS =================
 async def update_progress(current, total, msg, start_time, action_text, cancel_id=None):
     if cancel_id and CANCEL_FLAGS.get(cancel_id): raise Exception("CANCELLED")
     if total == 0: total = current + 1 
@@ -243,14 +245,13 @@ async def download_part(session, url, start, end, part_path, progress, msg, star
                 if CANCEL_FLAGS.get(cancel_id): raise Exception("CANCELLED")
                 await f.write(chunk)
                 progress['downloaded'] += len(chunk)
-                await update_progress(progress['downloaded'], progress['total'], msg, start_time, "⚡ Parallel Python DL...", cancel_id)
+                await update_progress(progress['downloaded'], progress['total'], msg, start_time, "⚡ Native Downloading...", cancel_id)
 
 def merge_files_sync(file_path, num_parts):
     with open(file_path, 'wb') as outfile:
         for i in range(num_parts):
             part_path = f"{file_path}.part{i}"
-            with open(part_path, 'rb') as infile:
-                shutil.copyfileobj(infile, outfile, length=4*1024*1024)
+            with open(part_path, 'rb') as infile: shutil.copyfileobj(infile, outfile, length=4*1024*1024)
             os.remove(part_path)
 
 async def download_with_python_native(url, file_path, msg, cancel_id, link_data):
@@ -268,8 +269,7 @@ async def download_with_python_native(url, file_path, msg, cancel_id, link_data)
         if supports_range and total_size > 10 * 1024 * 1024:
             num_parts = 4 
             part_size = total_size // num_parts
-            tasks = []
-            progress = {'downloaded': 0, 'total': total_size}
+            tasks, progress = [], {'downloaded': 0, 'total': total_size}
             for i in range(num_parts):
                 start = i * part_size
                 end = total_size - 1 if i == num_parts - 1 else (start + part_size - 1)
@@ -290,14 +290,15 @@ async def download_with_python_native(url, file_path, msg, cancel_id, link_data)
                         downloaded += len(chunk)
                         if total_size > 0: await update_progress(downloaded, total_size, msg, start_time, "📥 Native Downloading...", cancel_id)
 
-async def upload_with_python_native(file_path, file_name, msg, parent_id=DRIVE_FOLDER_ID, cancel_id=None):
+async def upload_with_python_native(file_path, file_name, msg, parent_id=DRIVE_FOLDER_ID, cancel_id=None, start_time=None):
+    if not start_time: start_time = time.time()
     success, service = get_drive_service()
     if not success: return False, service, 0, 0
     file_size = os.path.getsize(file_path)
     media = MediaFileUpload(file_path, chunksize=20*1024*1024, resumable=True) 
     request = service.files().create(body={'name': file_name, 'parents': [parent_id]}, media_body=media, fields='id')
     
-    response, start_time = None, time.time()
+    response = None
     while response is None:
         if cancel_id and CANCEL_FLAGS.get(cancel_id): raise Exception("CANCELLED")
         status, response = await asyncio.to_thread(functools.partial(request.next_chunk, num_retries=5))
@@ -311,7 +312,7 @@ async def download_with_aria2(url, file_path, msg, cancel_id):
     dir_name = os.path.dirname(file_path) if os.path.dirname(file_path) else "."
     file_name = os.path.basename(file_path)
     
-    cmd = ["./aria2c", "--dir", dir_name, "--out", file_name, "--split=4", "--max-connection-per-server=4", "--min-split-size=10M", "--summary-interval=3", "-x4", url]
+    cmd = [os.path.abspath("./aria2c"), "--dir", dir_name, "--out", file_name, "--split=4", "--max-connection-per-server=4", "--min-split-size=10M", "--summary-interval=3", "-x4", url]
     process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
     
     last_update = time.time()
@@ -328,30 +329,32 @@ async def download_with_aria2(url, file_path, msg, cancel_id):
             except: pass
 
     await process.wait()
-    if process.returncode != 0: raise Exception("Aria2 Download Failed")
+    if process.returncode != 0: raise Exception("Aria2 Process Failed")
 
 async def upload_with_rclone(file_path, file_name, msg, parent_id=DRIVE_FOLDER_ID, cancel_id=None, start_time=None):
     is_dir = os.path.isdir(file_path)
     rclone_dest = f"gdrive:{file_name}" if not is_dir else f"gdrive:/{file_name}"
     
-    cmd = ["./rclone", "copy" if is_dir else "copyto", file_path, rclone_dest, "--config", "rclone.conf", "--drive-root-folder-id", parent_id, "--stats", "3s", "-P"]
+    cmd = [os.path.abspath("./rclone"), "copy" if is_dir else "copyto", file_path, rclone_dest, "--config", os.path.abspath("rclone.conf"), "--drive-root-folder-id", parent_id, "--stats", "3s", "-P"]
     process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
     last_update = time.time()
+    last_output = ""
     
     while True:
         if CANCEL_FLAGS.get(cancel_id): process.terminate(); raise Exception("CANCELLED")
         line = await process.stdout.readline()
         if not line: break
         text = line.decode('utf-8').strip()
+        if text: last_output = text
         
         if "Transferred:" in text and "ETA" in text and (time.time() - last_update > 3):
             try:
-                await msg.edit_text(f"☁️ **Rclone High-Speed Uploading...**\n\n`{text}`", reply_markup=get_cancel_markup(cancel_id))
+                await msg.edit_text(f"☁️ **Rclone Fast Uploading...**\n\n`{text}`", reply_markup=get_cancel_markup(cancel_id))
                 last_update = time.time()
             except: pass
 
     await process.wait()
-    if process.returncode != 0: raise Exception("Rclone Upload Failed")
+    if process.returncode != 0: raise Exception(f"Rclone Failed. Last output: {last_output}")
 
     success, service = get_drive_service()
     if not success: return False, "Auth Error", 0, 0
@@ -365,7 +368,7 @@ async def upload_with_rclone(file_path, file_name, msg, parent_id=DRIVE_FOLDER_I
             BOT_STATS["uploads"] += 1
             BOT_STATS["bytes_uploaded"] += f_size
             return True, f_id, f_size, time.time() - (start_time or time.time())
-        return False, "File ID not found", 0, 0
+        return False, "File ID not found after upload", 0, 0
     except Exception as e: return False, str(e), 0, 0
 
 async def clone_gdrive_item(item_id, is_folder=False, parent_id=DRIVE_FOLDER_ID, msg=None):
@@ -401,8 +404,26 @@ def extract_zip(zip_path, extract_dir):
         return True, "Success"
     except Exception as e: return False, str(e)
 
+async def upload_extracted_folder(extract_dir, base_folder_name, parent_id, msg, cancel_id, start_time):
+    success, service = get_drive_service()
+    base_g_id = service.files().create(body={'name': base_folder_name, 'mimeType': 'application/vnd.google-apps.folder', 'parents': [parent_id]}, fields='id').execute().get('id')
+    folder_mapping = {extract_dir: base_g_id}
+    total_files = 0
+    for root, dirs, files in os.walk(extract_dir):
+        if CANCEL_FLAGS.get(cancel_id): raise Exception("CANCELLED")
+        current_parent = folder_mapping[root]
+        for d in dirs:
+            new_id = service.files().create(body={'name': d, 'mimeType': 'application/vnd.google-apps.folder', 'parents': [current_parent]}, fields='id').execute().get('id')
+            folder_mapping[os.path.join(root, d)] = new_id
+        for f in files:
+            if CANCEL_FLAGS.get(cancel_id): raise Exception("CANCELLED")
+            fpath = os.path.join(root, f)
+            await msg.edit_text(f"☁️ Uploading: `{f}`...\nFolder: `{os.path.basename(root)}`", reply_markup=get_cancel_markup(cancel_id))
+            up_success, _, _, _ = await upload_with_python_native(fpath, f, msg, current_parent, cancel_id)
+            if up_success: total_files += 1
+    return total_files, base_g_id
 
-# ================= MAIN PROCESS =================
+# ================= MAIN PROCESS WITH FALLBACK =================
 async def process_download(client, message, url, file_name, extract=False):
     msg = await app.send_message(message.chat.id, "📥 Preparing Connection...")
     file_path = os.path.join(os.getcwd(), file_name)
@@ -416,6 +437,7 @@ async def process_download(client, message, url, file_name, extract=False):
     gd_size = link_data.get("gd_size", 0)
 
     try:
+        # Phase 1: Download
         if is_gd and not extract:
             success, service = get_drive_service()
             await msg.edit_text("🔄 High-Speed GDrive Cloning...")
@@ -424,10 +446,15 @@ async def process_download(client, message, url, file_name, extract=False):
             return
             
         if not is_gd:
-            # FALLBACK SYSTEM FOR DOWNLOADING
-            if os.path.exists("./aria2c"):
-                await msg.edit_text("⚡ Starting Aria2c Downloader...", reply_markup=get_cancel_markup(cancel_id))
-                await download_with_aria2(url, file_path, msg, cancel_id)
+            if os.path.exists(os.path.abspath("./aria2c")):
+                try:
+                    await msg.edit_text("⚡ Starting Aria2c Downloader...", reply_markup=get_cancel_markup(cancel_id))
+                    await download_with_aria2(url, file_path, msg, cancel_id)
+                except Exception as e:
+                    if str(e) == "CANCELLED": raise e
+                    print("Aria2 Error, falling back:", e)
+                    await msg.edit_text("⚡ Fallback: Native Python Downloader...", reply_markup=get_cancel_markup(cancel_id))
+                    await download_with_python_native(url, file_path, msg, cancel_id, link_data)
             else:
                 await msg.edit_text("⚡ Starting Native Python Downloader...", reply_markup=get_cancel_markup(cancel_id))
                 await download_with_python_native(url, file_path, msg, cancel_id, link_data)
@@ -445,21 +472,26 @@ async def process_download(client, message, url, file_name, extract=False):
                     except: pass
             fh.close()
 
+        # Phase 2: Extract (if asked)
         if extract and file_name.lower().endswith('.zip'):
             await msg.edit_text("📦 Extracting ZIP...")
             ext_dir = file_path + "_ext"
             os.makedirs(ext_dir, exist_ok=True)
-            success, ext_res = await asyncio.to_thread(lambda: extract_zip(file_path, ext_dir))
+            success, ext_res = await asyncio.to_thread(extract_zip, file_path, ext_dir)
             if not success: return await msg.edit_text(f"❌ Extraction Error: {ext_res}")
             
             f_name = file_name.replace(".zip", "")
-            
-            # FALLBACK SYSTEM FOR EXTRACTED FOLDER UPLOAD
-            if os.path.exists("./rclone"):
-                await msg.edit_text("☁️ Rclone Uploading Extracted Folder...", reply_markup=get_cancel_markup(cancel_id))
-                up_success, new_f_id, _, _ = await upload_with_rclone(ext_dir, f_name, msg, DRIVE_FOLDER_ID, cancel_id, start_time)
-            else:
-                await msg.edit_text("☁️ Native Python Uploading Extracted Folder...", reply_markup=get_cancel_markup(cancel_id))
+            up_success = False
+            if os.path.exists(os.path.abspath("./rclone")) and os.path.exists("rclone.conf"):
+                try:
+                    await msg.edit_text("☁️ Rclone Uploading Extracted Folder...", reply_markup=get_cancel_markup(cancel_id))
+                    up_success, new_f_id, _, _ = await upload_with_rclone(ext_dir, f_name, msg, DRIVE_FOLDER_ID, cancel_id, start_time)
+                except Exception as e:
+                    if str(e) == "CANCELLED": raise e
+                    print("Rclone Folder Upload Error, falling back:", e)
+                    
+            if not up_success:
+                await msg.edit_text("☁️ Native Uploading Extracted Folder...", reply_markup=get_cancel_markup(cancel_id))
                 up_success, new_f_id = await upload_extracted_folder(ext_dir, f_name, DRIVE_FOLDER_ID, msg, cancel_id, start_time)
 
             if up_success:
@@ -468,6 +500,7 @@ async def process_download(client, message, url, file_name, extract=False):
             await asyncio.to_thread(shutil.rmtree, ext_dir, ignore_errors=True)
             return
 
+        # Phase 3: Preview
         preview_id = None
         if file_name.lower().endswith(('.mp4', '.mkv', '.avi', '.webm')):
             await msg.edit_text("🎬 Extracting Frames...", reply_markup=get_cancel_markup(cancel_id))
@@ -477,13 +510,20 @@ async def process_download(client, message, url, file_name, extract=False):
                 preview_id = p_id
                 PREVIEW_CACHE[preview_id] = frames
 
-        # FALLBACK SYSTEM FOR FILE UPLOAD
-        if os.path.exists("./rclone"):
-            await msg.edit_text("☁️ Starting Rclone Upload...", reply_markup=get_cancel_markup(cancel_id))
-            success, file_id, file_size, up_time = await upload_with_rclone(file_path, file_name, msg, DRIVE_FOLDER_ID, cancel_id, start_time)
-        else:
+        # Phase 4: Upload
+        up_success = False
+        if os.path.exists(os.path.abspath("./rclone")) and os.path.exists("rclone.conf"):
+            try:
+                await msg.edit_text("☁️ Starting Rclone Upload...", reply_markup=get_cancel_markup(cancel_id))
+                success, file_id, file_size, up_time = await upload_with_rclone(file_path, file_name, msg, DRIVE_FOLDER_ID, cancel_id, start_time)
+                up_success = success
+            except Exception as e:
+                if str(e) == "CANCELLED": raise e
+                print("Rclone Upload Error, falling back:", e)
+                
+        if not up_success:
             await msg.edit_text("☁️ Starting Native Python Upload...", reply_markup=get_cancel_markup(cancel_id))
-            success, file_id, file_size, up_time = await upload_with_python_native(file_path, file_name, msg, DRIVE_FOLDER_ID, cancel_id)
+            success, file_id, file_size, up_time = await upload_with_python_native(file_path, file_name, msg, DRIVE_FOLDER_ID, cancel_id, start_time)
         
         if success:
             txt = generate_result_text(file_name, file_id, file_size, time.time() - start_time)
@@ -500,11 +540,11 @@ async def process_download(client, message, url, file_name, extract=False):
         for f in os.listdir():
             if f.endswith('.aria2'): os.remove(f)
 
-# ================= MESSAGE & CALLBACK HANDLERS =================
+# ================= COMMANDS & CALLBACKS =================
 @app.on_message(filters.command("start"))
 async def start_command(client, message):
     if not check_auth(message.from_user.id): return
-    await message.reply_text("🚀 **SpeedPro (Aria2+Rclone) Ready!**\nSend me a Link, GDrive Link, or File.\n\n/myfiles, /search <name>, /stats, /storage, /logs")
+    await message.reply_text("🚀 **SpeedPro Bot Ready!**\nSend me a Link, GDrive Link, or File.\n\n/myfiles, /search <name>, /stats, /storage, /logs")
 
 @app.on_message(filters.command("stats"))
 async def stats_command(client, message):
@@ -625,12 +665,18 @@ async def handle_telegram_files(client, message):
         file_path = await message.download(progress=prog_cb)
         if CANCEL_FLAGS.get(cancel_id): raise Exception("CANCELLED")
         
-        if os.path.exists("./rclone"):
-            await msg.edit_text("☁️ Rclone Uploading...", reply_markup=get_cancel_markup(cancel_id))
-            success, file_id, file_size, up_time = await upload_with_rclone(file_path, os.path.basename(file_path), msg, DRIVE_FOLDER_ID, cancel_id, start_time)
-        else:
+        up_success = False
+        if os.path.exists(os.path.abspath("./rclone")) and os.path.exists("rclone.conf"):
+            try:
+                await msg.edit_text("☁️ Rclone Uploading...", reply_markup=get_cancel_markup(cancel_id))
+                success, file_id, file_size, up_time = await upload_with_rclone(file_path, os.path.basename(file_path), msg, DRIVE_FOLDER_ID, cancel_id, start_time)
+                up_success = success
+            except Exception as e:
+                print("Rclone telegram upload failed, falling back:", e)
+                
+        if not up_success:
             await msg.edit_text("☁️ Native Uploading...", reply_markup=get_cancel_markup(cancel_id))
-            success, file_id, file_size, up_time = await upload_with_python_native(file_path, os.path.basename(file_path), msg, DRIVE_FOLDER_ID, cancel_id)
+            success, file_id, file_size, up_time = await upload_with_python_native(file_path, os.path.basename(file_path), msg, DRIVE_FOLDER_ID, cancel_id, start_time)
             
         if success:
             await msg.edit_text(generate_result_text(os.path.basename(file_path), file_id, file_size, time.time() - start_time))
@@ -707,7 +753,7 @@ async def general_cb(client, query):
 # ================= WEB SERVER FOR RENDER =================
 async def start_web_server():
     app_web = web.Application()
-    app_web.router.add_get('/', lambda r: web.Response(text="🚀 Ultimate SpeedPro Bot (Aria2+Rclone/Fallback) is Running on Render!"))
+    app_web.router.add_get('/', lambda r: web.Response(text="🚀 Ultimate SpeedPro Bot (Indestructible V2) is Running on Render!"))
     runner = web.AppRunner(app_web)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', PORT).start()
@@ -715,7 +761,7 @@ async def start_web_server():
 async def main():
     await start_web_server()
     await app.start()
-    logger.info("Bot LIVE on Render with Aria2 & Rclone (and Fallbacks)! 🚀")
+    logger.info("Bot LIVE on Render with Indestructible Fallbacks! 🚀")
     await idle()
     await app.stop()
 
