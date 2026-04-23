@@ -10,10 +10,10 @@ import functools
 import zipfile
 import shutil
 import urllib.parse
-import urllib.request
 import tarfile
 import stat
 import io
+import requests
 
 try: asyncio.get_event_loop()
 except RuntimeError: asyncio.set_event_loop(asyncio.new_event_loop())
@@ -51,35 +51,56 @@ PORT = int(os.environ.get("PORT", 8080))
 AUTHORIZED_USERS = [int(u.strip()) for u in AUTH_USERS_STR.split(",") if u.strip().isdigit()]
 SCOPES = ['https://www.googleapis.com/auth/drive']
 
-# ================= AUTO SETUP ARIA2 & RCLONE =================
+# ================= AUTO SETUP ARIA2 & RCLONE (FIXED) =================
 def setup_binaries_and_config():
     print("⚙️ Initializing Server Environment...")
-    # Generate Rclone Config
+    
+    # 1. Generate Rclone Config
     if GOOGLE_OAUTH_TOKEN:
         try:
             td = json.loads(GOOGLE_OAUTH_TOKEN)
             conf = f"[gdrive]\ntype = drive\nclient_id = {td.get('client_id','')}\nclient_secret = {td.get('client_secret','')}\nscope = drive\ntoken = {GOOGLE_OAUTH_TOKEN}\nroot_folder_id = {DRIVE_FOLDER_ID}\n"
             with open("rclone.conf", "w") as f: f.write(conf)
-        except Exception as e: print("Rclone Config Error:", e)
+            print("✅ Rclone Config Generated!")
+        except Exception as e: print("❌ Rclone Config Error:", e)
 
-    # Download Rclone
+    # 2. Download Rclone (Latest version)
     if not os.path.exists("./rclone"):
         print("⬇️ Downloading Rclone...")
-        urllib.request.urlretrieve("https://downloads.rclone.org/v1.65.0/rclone-v1.65.0-linux-amd64.zip", "rclone.zip")
-        with zipfile.ZipFile("rclone.zip", 'r') as z: z.extract("rclone-v1.65.0-linux-amd64/rclone", ".")
-        shutil.move("rclone-v1.65.0-linux-amd64/rclone", "./rclone")
-        os.chmod("./rclone", os.stat("./rclone").st_mode | stat.S_IEXEC)
-        shutil.rmtree("rclone-v1.65.0-linux-amd64", ignore_errors=True)
-        os.remove("rclone.zip")
+        try:
+            res = requests.get("https://downloads.rclone.org/rclone-current-linux-amd64.zip")
+            with open("rclone.zip", "wb") as f: f.write(res.content)
+            with zipfile.ZipFile("rclone.zip", 'r') as z:
+                for info in z.infolist():
+                    if info.filename.endswith("/rclone") and not info.is_dir():
+                        info.filename = "rclone"
+                        z.extract(info, ".")
+            os.chmod("./rclone", 0o755) # Give execution permission
+            os.remove("rclone.zip")
+            print("✅ Rclone Ready!")
+        except Exception as e: print("❌ Failed to download Rclone:", e)
 
-    # Download Aria2
+    # 3. Download Aria2c (Reliable Static Build Mirror)
     if not os.path.exists("./aria2c"):
         print("⬇️ Downloading Aria2c...")
-        urllib.request.urlretrieve("https://github.com/P3TERX/Aria2-Pro-Core/releases/download/1.37.0/aria2-1.37.0-static-linux-amd64.tar.gz", "aria2.tar.gz")
-        with tarfile.open("aria2.tar.gz", "r:gz") as tar: tar.extract("aria2c", ".")
-        os.chmod("./aria2c", os.stat("./aria2c").st_mode | stat.S_IEXEC)
-        os.remove("aria2.tar.gz")
+        try:
+            # Most reliable Linux 64-bit static build mirror
+            url = "https://github.com/q3aql/aria2-static-builds/releases/download/v1.36.0/aria2-1.36.0-linux-gnu-64bit-build1.tar.bz2"
+            res = requests.get(url)
+            with open("aria2.tar.bz2", "wb") as f: f.write(res.content)
+            
+            with tarfile.open("aria2.tar.bz2", "r:bz2") as tar:
+                for member in tar.getmembers():
+                    if member.name.endswith("/aria2c") and member.isfile():
+                        member.name = "aria2c"
+                        tar.extract(member, ".")
+            
+            os.chmod("./aria2c", 0o755) # Give execution permission
+            os.remove("aria2.tar.bz2")
+            print("✅ Aria2c Ready!")
+        except Exception as e: print("❌ Failed to download Aria2c:", e)
 
+# Run the setup before starting the bot
 setup_binaries_and_config()
 
 # ================= LOGGING SETUP =================
@@ -258,7 +279,6 @@ async def upload_with_rclone(file_path, file_name, msg, parent_id=DRIVE_FOLDER_I
     await process.wait()
     if process.returncode != 0: raise Exception("Rclone Upload Failed")
 
-    # Fetch File ID from Google API after Rclone upload
     success, service = get_drive_service()
     if not success: return False, "Auth Error", 0, 0
     try:
@@ -322,7 +342,6 @@ async def process_download(client, message, url, file_name, extract=False):
     gd_size = link_data.get("gd_size", 0)
 
     try:
-        # GDrive Clone logic
         if is_gd and not extract:
             success, service = get_drive_service()
             await msg.edit_text("🔄 High-Speed GDrive Cloning...")
@@ -330,12 +349,10 @@ async def process_download(client, message, url, file_name, extract=False):
             await msg.edit_text(generate_result_text(file_name, res.get('id'), gd_size, time.time()-start_time))
             return
             
-        # Download Phase (Aria2c for external links)
         if not is_gd:
             await msg.edit_text("⚡ Starting Aria2c Downloader...", reply_markup=get_cancel_markup(cancel_id))
             await download_with_aria2(url, file_path, msg, cancel_id)
         else:
-            # Native Python GDrive Download for Zip Extraction
             success, service = get_drive_service()
             request = service.files().get_media(fileId=gd_id)
             fh = io.FileIO(file_path, 'wb')
@@ -349,7 +366,6 @@ async def process_download(client, message, url, file_name, extract=False):
                     except: pass
             fh.close()
 
-        # Extract Phase
         if extract and file_name.lower().endswith('.zip'):
             await msg.edit_text("📦 Extracting ZIP...")
             ext_dir = file_path + "_ext"
@@ -358,7 +374,6 @@ async def process_download(client, message, url, file_name, extract=False):
             if not success: return await msg.edit_text(f"❌ Extraction Error: {ext_res}")
             
             f_name = file_name.replace(".zip", "")
-            # Rclone Folder Upload! Much faster than looping Python
             await msg.edit_text("☁️ Rclone Uploading Extracted Folder...", reply_markup=get_cancel_markup(cancel_id))
             up_success, new_f_id, _, _ = await upload_with_rclone(ext_dir, f_name, msg, DRIVE_FOLDER_ID, cancel_id, start_time)
             
@@ -368,7 +383,6 @@ async def process_download(client, message, url, file_name, extract=False):
             await asyncio.to_thread(shutil.rmtree, ext_dir, ignore_errors=True)
             return
 
-        # Preview Phase
         preview_id = None
         if file_name.lower().endswith(('.mp4', '.mkv', '.avi', '.webm')):
             await msg.edit_text("🎬 Extracting Frames...", reply_markup=get_cancel_markup(cancel_id))
@@ -378,7 +392,6 @@ async def process_download(client, message, url, file_name, extract=False):
                 preview_id = p_id
                 PREVIEW_CACHE[preview_id] = frames
 
-        # Upload Phase (Rclone for local files)
         await msg.edit_text("☁️ Starting Rclone Upload...", reply_markup=get_cancel_markup(cancel_id))
         success, file_id, file_size, up_time = await upload_with_rclone(file_path, file_name, msg, DRIVE_FOLDER_ID, cancel_id, start_time)
         
@@ -510,7 +523,7 @@ async def handle_telegram_files(client, message):
         else: await msg.edit_text("❌ Upload Failed.")
     except Exception as e: await msg.edit_text(f"❌ Error: {e}")
     finally:
-        if 'file_path' in locals() and os.path.exists(file_path): os.remove(file_path)
+        if 'file_path' in locals() and file_path and os.path.exists(file_path): os.remove(file_path)
 
 @app.on_message(filters.text & ~filters.command(["start", "myfiles", "stats", "logs", "storage", "search"]))
 async def handle_text_input(client, message):
