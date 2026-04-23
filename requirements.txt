@@ -9,3 +9,4 @@ aiofiles
 cachetools
 opencv-python-headless
 Pillow
+nest-asyncio
